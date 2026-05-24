@@ -78,7 +78,10 @@ async def execute_action(request: Request) -> Response:
             "action_id": action_id,
             "action": "<unknown>",
             "args": {},
-            "tier": 0,
+            # tier defaults to 1 (read; harmless) since we don't know
+            # what the original recommendation was; the schema enum
+            # forbids 0. rejected_reason carries the truthful cause.
+            "tier": 1,
             "approval_token_valid": False,
             "security_code_required": False,
             "executed": False,

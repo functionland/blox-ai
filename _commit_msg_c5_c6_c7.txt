@@ -1,0 +1,63 @@
+C5+C6+C7: conversational state, SIGHUP runbook reload, RKLLM wrapper
+
+C5 - Session manager + conversational endpoints
+- src/session/manager.py: SessionManager (30min sliding TTL, 50-session
+  cap, LRU eviction). Per-session asyncio.Queue(maxsize=1) for reply
+  delivery. sanitize_for_log helper redacts IPv4 + BSSID before any log
+  line that might echo phone_context fields.
+- src/runtime/mock_backend.py: scripted user_question path triggered by
+  "ask " in the prompt (testable + opt-in; default C2 path unchanged).
+- src/session/tool_call_loop.py: bridge extended to pause on user_question,
+  await session.reply_queue, emit user_reply_received on ack. 10-min
+  wait timeout maps to USER_REPLY_TIMEOUT error. C6 sentinel for /cancel.
+- src/routes/troubleshoot.py: POST /troubleshoot/user-reply (404
+  unknown session, 400 question_id mismatch, idempotent same-id
+  retry-200 via reply_queue's maxsize=1) + POST /troubleshoot/phone-context
+  (validates inner shape against phone_context.schema.json; in-memory
+  ONLY; never logs raw values; sanitizes any echoed validation error).
+- 27 pytest cases (TTL, LRU, threading race for user_question E2E).
+
+C6 - SIGHUP runbook reload + /feedback + /pending + /cancel
+- src/runtime/runbook_frontmatter.py: vendored from fula-ota (will add
+  hash-check test once both repos are co-located in CI).
+- src/runtime/runbook_loader.py: RunbookLoader with thread-safe text
+  cache, load_initial(), reload() (refuses on missing/malformed/schema-
+  bump/downgrade), emits to /var/log/fula/events.jsonl on every outcome.
+- src/app.py lifespan: install signal.SIGHUP handler (skipped on
+  Windows + on TestClient worker threads — both raise expected errors).
+- src/routes/feedback.py: POST /feedback with feedback_request.schema.json
+  validation. Session-detached acceptance (200 even on evicted session,
+  per Phase 16 contract). CR/LF stripped from comment before write.
+  Appends one JSONL line per request to ai-feedback.jsonl. Output
+  validated against feedback_log_line.schema.json before write.
+- src/routes/pending.py: GET /pending reads last line of
+  ai-pending-actions.jsonl with 4KB tail-seek. Missing file or
+  malformed last line returns {} (Phase 15 panel treats as "nothing").
+- src/routes/cancel.py: POST /cancel pushes a _CancelSentinel onto
+  session.reply_queue + removes the session. Bridge sees sentinel via
+  duck-typed class name check, emits SESSION_CANCELLED error, returns.
+- 22 pytest cases.
+
+C7 - RKLLMBackend ctypes wrapper + try-load fallback
+- src/runtime/rkllm_runtime.py: RKLLMRuntime (ctypes wrapper around
+  librkllmrt.so mirroring loyal-agent's pattern) + RKLLMBackend
+  (async-iterator adapter with same shape as MockBackend) + try_load()
+  (returns None on any of: .so missing, model file missing, ctypes
+  load error, rkllm_init non-zero). Lifespan calls try_load and falls
+  back to MockBackend cleanly so dev/CI/amd64/lab-without-model all
+  still boot.
+- parse_tool_calls(): Qwen native <tool_call>{...}</tool_call> parser,
+  defensive (skips malformed JSON inside blocks).
+- 19 pytest cases all mock ctypes; real inference verified by lab
+  smoke once Qwen .rkllm file is published to CDN (operational
+  dependency, deferred).
+
+Test totals: 145 pytest (12 C1 + 22 C2 + 44 C3 + 27 C5 + 22 C6 + 19
+C7 = 146 less 1 conftest helper). Same suite green on Windows dev +
+lab device + CI runner.
+
+Skipped per the user directive: C4 (/execute-action + executor +
+whitelist + audit log + HMAC). Without C4 the app's Approve buttons
+return 404 — recommended_action events flow through SSE but cannot
+actually execute. C4 is security-critical and needs codex-advisor in
+the pre+post review cycle; deferred to a separate session.

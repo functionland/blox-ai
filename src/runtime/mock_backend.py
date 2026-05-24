@@ -58,6 +58,11 @@ class MockBackend:
         tool_call_loop.py constructs the tool_result event by calling
         the diag executor with the tool name + args from each tool_call.
 
+        Prompt routing:
+          - default: diag/summary → verdict (C2 happy path).
+          - "ask " in prompt: emits a user_question; bridge waits for
+            /troubleshoot/user-reply (C5 conversational path).
+
         Real RKLLM-backed sequencing (C7) will replace this with token
         streaming + tool-call JSON parsing, but the event shapes stay
         identical.
@@ -69,6 +74,43 @@ class MockBackend:
             "protocol_version": 3,
             "ttl_seconds": 1800,
         }
+
+        if "ask " in prompt.lower():
+            # C5 conversational path: model asks then waits.
+            yield {
+                "type": "thought",
+                "payload": "I need more information before I can diagnose.",
+            }
+            yield {
+                "type": "user_question",
+                "question_id": "mock-q-1",
+                "payload": {
+                    "question": "When did the device first start having trouble?",
+                    "expected_response_type": "text",
+                },
+            }
+            # Bridge will inject user_reply_received after /user-reply lands.
+            # The mock backend doesn't consume the reply itself (real RKLLM
+            # would inject into model context); here we just continue.
+            yield {
+                "type": "thought",
+                "payload": "Thanks. Based on your answer, checking diag/summary.",
+            }
+            yield {
+                "type": "tool_call",
+                "call_id": "mock-call-1",
+                "payload": {"tool": "diag/summary", "args": {}},
+            }
+            yield {
+                "type": "verdict",
+                "payload": {
+                    "summary": "Mock backend: nothing actionable after Q&A.",
+                    "severity": "green",
+                },
+            }
+            return
+
+        # Default C2 happy path
         yield {
             "type": "thought",
             "payload": f"Mock backend received prompt ({len(prompt)} chars). "
@@ -79,7 +121,6 @@ class MockBackend:
             "call_id": "mock-call-1",
             "payload": {"tool": "diag/summary", "args": {}},
         }
-        # bridge injects tool_result here
         yield {
             "type": "thought",
             "payload": "diag/summary shows all subsystems green. "

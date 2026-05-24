@@ -10,18 +10,35 @@ C2 ships a simple async-iterator bridge that:
   4. Executor failures map cleanly to tool_result.ok=false + error
      field (so the model can read the error and continue reasoning).
 
-In C2 the backend is the MockBackend's scripted sequence. C7 replaces
-that with a real RKLLM-driven backend; this bridge stays unchanged.
+C5 extends the bridge to handle `user_question` events:
+  - records pending_question_id on the session
+  - PAUSES the SSE stream (awaits the session's reply_queue)
+  - on reply, yields a `user_reply_received` event then resumes
+
+In C5 the backend is still the MockBackend's scripted sequence. C7
+replaces that with a real RKLLM-driven backend; this bridge stays
+unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import AsyncIterator, Awaitable, Callable
 
 import jsonschema
 
+from src.session.manager import SessionState
+
 
 logger = logging.getLogger("blox-ai.bridge")
+
+
+# Max wall-clock the bridge will wait for a /user-reply before giving up.
+# Generous because some humans take a while to read + type. Aligns with
+# the parent plan's 30-min session TTL but caps a single question well
+# under that so a forgotten chat doesn't hold an SSE connection open
+# for the full TTL.
+USER_REPLY_WAIT_SEC = 10 * 60
 
 
 # ToolExecutor signature: (tool_name, args) → awaitable[payload dict]
@@ -32,12 +49,17 @@ async def stream_troubleshoot(
     backend_events: AsyncIterator[dict],
     tool_executor: ToolExecutor,
     validator: jsonschema.Draft202012Validator,
+    session: SessionState | None = None,
 ) -> AsyncIterator[dict]:
     """Bridge generator. Yields validated event dicts ready to wrap as SSE.
 
     Schema-invalid events are swallowed and replaced with a synthetic
     error event; this protects the SSE renderer from a backend bug that
     would otherwise crash mid-stream.
+
+    When `session` is None, user_question events are passed through
+    without waiting — callers that don't use SessionManager get the
+    pre-C5 behaviour (model asks, no reply machinery).
     """
     async for event in backend_events:
         if not _validate(event, validator):
@@ -46,7 +68,9 @@ async def stream_troubleshoot(
 
         yield event
 
-        if event.get("type") == "tool_call":
+        evtype = event.get("type")
+
+        if evtype == "tool_call":
             try:
                 payload = await tool_executor(
                     event["payload"]["tool"],
@@ -67,13 +91,52 @@ async def stream_troubleshoot(
                     "error": _truncate(str(e), 2000),
                 }
             if not _validate(tool_result, validator):
-                # The tool_result we constructed somehow doesn't validate
-                # (would mean the executor returned a payload shape we
-                # can't carry, OR our error truncation made it invalid).
-                # Surface to client as a stream-terminating error.
                 yield _schema_violation_error(tool_result)
                 return
             yield tool_result
+
+        elif evtype == "user_question" and session is not None:
+            # Phase 11 contract: PAUSE the stream until /user-reply lands.
+            session.pending_question_id = event["question_id"]
+            try:
+                reply = await asyncio.wait_for(
+                    session.reply_queue.get(),
+                    timeout=USER_REPLY_WAIT_SEC,
+                )
+            except asyncio.TimeoutError:
+                yield {
+                    "type": "error",
+                    "code": "USER_REPLY_TIMEOUT",
+                    "message": (
+                        f"timed out waiting for user reply to question "
+                        f"{event['question_id']!r} "
+                        f"after {USER_REPLY_WAIT_SEC}s"
+                    ),
+                    "recoverable": False,
+                }
+                return
+            # C6: /cancel pushes a sentinel onto the queue. Identify it
+            # via duck-typing (avoids a circular import on the route
+            # module).
+            if reply.__class__.__name__ == "_CancelSentinel":
+                yield {
+                    "type": "error",
+                    "code": "SESSION_CANCELLED",
+                    "message": "session cancelled by /cancel",
+                    "recoverable": False,
+                }
+                return
+            ack = {
+                "type": "user_reply_received",
+                "question_id": event["question_id"],
+                "session_id": session.session_id,
+            }
+            if not _validate(ack, validator):
+                yield _schema_violation_error(ack)
+                return
+            yield ack
+            session.pending_question_id = None
+            _ = reply
 
 
 def _validate(event: dict, validator: jsonschema.Draft202012Validator) -> bool:

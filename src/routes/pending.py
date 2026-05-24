@@ -23,7 +23,10 @@ router = APIRouter()
 logger = logging.getLogger("blox-ai.pending")
 
 
-DEFAULT_PENDING_LOG_PATH = "/var/log/fula/ai-pending-actions.jsonl"
+DEFAULT_PENDING_LOG_PATH = os.environ.get(
+    "BLOX_AI_PENDING_LOG_PATH",
+    "/var/log/fula/ai-pending-actions.jsonl",
+)
 
 
 def _pending_log_path(request: Request) -> str:

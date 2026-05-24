@@ -22,7 +22,10 @@ router = APIRouter()
 logger = logging.getLogger("blox-ai.feedback")
 
 
-DEFAULT_FEEDBACK_LOG_PATH = "/var/log/fula/ai-feedback.jsonl"
+DEFAULT_FEEDBACK_LOG_PATH = os.environ.get(
+    "BLOX_AI_FEEDBACK_LOG_PATH",
+    "/var/log/fula/ai-feedback.jsonl",
+)
 
 
 def _now_iso() -> str:

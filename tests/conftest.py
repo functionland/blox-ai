@@ -71,11 +71,39 @@ def _real_schemas_in_use() -> bool:
 
 @pytest.fixture
 def client(schema_dir_with_all_required, monkeypatch):
-    """Build a TestClient pointing the app at our staged schema dir."""
+    """Build a TestClient pointing the app at our staged schema dir.
+
+    Overrides the production RealDiagExecutor with MockDiagExecutor so
+    tests get deterministic per-tool responses (the real one shells out
+    to docker / kubo / dmesg / journalctl, none of which work on the
+    Windows dev box or in CI runners). Tests that specifically exercise
+    the real path use the `client_with_real_diag` fixture instead.
+    """
     from fastapi.testclient import TestClient
     monkeypatch.setenv("BLOX_AI_SCHEMA_DIR", str(schema_dir_with_all_required))
-    # Re-import app so the lifespan picks up our env.
-    for mod in ("src.app", "src.schemas", "src.runtime.mock_backend"):
+    for mod in ("src.app", "src.schemas", "src.runtime.mock_backend",
+                "src.runtime.mock_diag", "src.tools.diag_impls",
+                "src.session.tool_call_loop", "src.routes.troubleshoot",
+                "src.routes.diag"):
+        sys.modules.pop(mod, None)
+    from src.app import app as fresh_app
+    from src.runtime.mock_diag import MockDiagExecutor
+    with TestClient(fresh_app) as c:
+        c.app.state.tool_executor = MockDiagExecutor()
+        yield c
+
+
+@pytest.fixture
+def client_with_real_diag(schema_dir_with_all_required, monkeypatch):
+    """Variant of `client` that keeps RealDiagExecutor in place. Used by
+    C3 tests that mock subprocess + state-file reads at the impl-module
+    level rather than at the executor level."""
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("BLOX_AI_SCHEMA_DIR", str(schema_dir_with_all_required))
+    for mod in ("src.app", "src.schemas", "src.runtime.mock_backend",
+                "src.tools.diag_impls",
+                "src.session.tool_call_loop", "src.routes.troubleshoot",
+                "src.routes.diag"):
         sys.modules.pop(mod, None)
     from src.app import app as fresh_app
     with TestClient(fresh_app) as c:

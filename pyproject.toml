@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn[standard]>=0.27,<1",
     "jsonschema>=4.20,<5",
     "pydantic>=2.6,<3",
+    "docker>=7.0,<8",
 ]
 
 [project.optional-dependencies]

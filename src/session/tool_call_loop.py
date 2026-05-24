@@ -95,6 +95,16 @@ async def stream_troubleshoot(
                 return
             yield tool_result
 
+        elif evtype == "recommended_action" and session is not None:
+            # C4: stash for /execute-action lookup. The HMAC token
+            # binds to action_id; the executor dispatcher needs the
+            # full {action_name, args} pair to actually run anything.
+            session.issued_recommendations[event["action_id"]] = {
+                "action_name": event["action_name"],
+                "args": event.get("args") or {},
+                "tier": event["tier"],
+            }
+
         elif evtype == "user_question" and session is not None:
             # Phase 11 contract: PAUSE the stream until /user-reply lands.
             session.pending_question_id = event["question_id"]

@@ -14,17 +14,26 @@ The scripted sequence in C2:
     session_started → thought → tool_call(diag/summary)
                   ↳ (bridge injects tool_result)
     thought → verdict → recommended_action
+
+C4 wires an action_signer so recommended_action emits carry a real
+HMAC approval_token (otherwise /execute-action rejects them all at the
+token-validation gate). The action chosen (`docker.restart` with
+container=ipfs_host) is whitelisted in the canonical action_whitelist.json.
 """
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
-from typing import AsyncIterator
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Callable, Optional
 
 
-# 64 'a' chars — meets the recommended_action.approval_token minLength:64
-# constraint. C4 (executor) will replace with real HMAC tokens.
-_MOCK_APPROVAL_TOKEN = "a" * 64
+# Fallback token used when no signer is wired (e.g. C2/C3 tests that
+# don't exercise /execute-action). 64 'a' chars satisfies the schema's
+# minLength constraint; the executor will reject it on HMAC verify.
+_PLACEHOLDER_TOKEN = "a" * 64
+
+
+ActionSigner = Callable[[str], str]  # action_id → wire-format token
 
 
 @dataclass
@@ -34,6 +43,20 @@ class MockBackend:
     name: str = "mock"
     loaded: bool = True
     runbook_version: int = 0  # populated in C6 once the loader wires in
+    action_signer: Optional[ActionSigner] = field(default=None, repr=False)
+
+    def _token_for(self, action_id: str) -> str:
+        """Mint a real HMAC token via the wired signer, or fall back to
+        the placeholder. Returning the placeholder still produces a
+        schema-valid SSE event; /execute-action rejects it on HMAC
+        verify (which is the right behavior for tests that don't wire
+        the executor)."""
+        if self.action_signer is None:
+            return _PLACEHOLDER_TOKEN
+        try:
+            return self.action_signer(action_id)
+        except Exception:
+            return _PLACEHOLDER_TOKEN
 
     def status_snapshot(self) -> dict:
         """Shape that the /status route returns. Closed; only the documented
@@ -134,14 +157,18 @@ class MockBackend:
                 "root_cause": "no_issue_detected",
             },
         }
+        action_id = "mock-act-1"
         yield {
             "type": "recommended_action",
-            "action_id": "mock-act-1",
-            "action_name": "diag.noop",
-            "args": {},
-            "reasoning": "Mock backend has no real fix to recommend; "
-                        "emitting a placeholder for SSE plumbing testing.",
-            "confidence": 0.0,
+            "action_id": action_id,
+            "action_name": "docker.restart",
+            "args": {"container": "ipfs_host"},
+            "reasoning": "Mock backend recommendation (whitelisted "
+                        "docker.restart with arg-constraint-passing "
+                        "container=ipfs_host). On a real device + real "
+                        "backend, the model would pick this only when "
+                        "diag/containers shows an unhealthy kubo.",
+            "confidence": 0.8,
             "tier": 2,
-            "approval_token": _MOCK_APPROVAL_TOKEN,
+            "approval_token": self._token_for(action_id),
         }

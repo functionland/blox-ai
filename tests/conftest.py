@@ -69,9 +69,26 @@ def _real_schemas_in_use() -> bool:
     return _locate_fula_ota_api_dir() is not None
 
 
+def _staged_whitelist(tmp_path) -> Path | None:
+    """Copy the real fula-ota action_whitelist.json into tmp so the
+    executor has the canonical trust boundary. Falls back to None when
+    the fula-ota sibling isn't available (tests that need the executor
+    skip cleanly in that case)."""
+    api = _locate_fula_ota_api_dir()
+    if api is None:
+        return None
+    wl = api.parent / "action_whitelist.json"
+    if not wl.is_file():
+        return None
+    dest = tmp_path / "action_whitelist.json"
+    shutil.copy(wl, dest)
+    return dest
+
+
 @pytest.fixture
-def client(schema_dir_with_all_required, monkeypatch):
-    """Build a TestClient pointing the app at our staged schema dir.
+def client(schema_dir_with_all_required, tmp_path, monkeypatch):
+    """Build a TestClient pointing the app at our staged schema dir +
+    whitelist + writable audit log path.
 
     Overrides the production RealDiagExecutor with MockDiagExecutor so
     tests get deterministic per-tool responses (the real one shells out
@@ -81,29 +98,58 @@ def client(schema_dir_with_all_required, monkeypatch):
     """
     from fastapi.testclient import TestClient
     monkeypatch.setenv("BLOX_AI_SCHEMA_DIR", str(schema_dir_with_all_required))
+
+    # C4: point the executor at a staged whitelist + writable audit/sec.
+    wl = _staged_whitelist(tmp_path)
+    if wl is not None:
+        monkeypatch.setenv("BLOX_AI_WHITELIST_PATH", str(wl))
+    audit_log = tmp_path / "ai-actions.jsonl"
+    monkeypatch.setenv("BLOX_AI_AUDIT_LOG_PATH", str(audit_log))
+    sec_code = tmp_path / "security-code"
+    sec_code.write_text("1234")
+    monkeypatch.setenv("BLOX_AI_SECURITY_CODE_PATH", str(sec_code))
+    secret = tmp_path / "approval-secret"
+    monkeypatch.setenv("BLOX_AI_APPROVAL_SECRET_PATH", str(secret))
+    flag_dir = tmp_path / "commands"
+    flag_dir.mkdir()
+    monkeypatch.setenv("BLOX_AI_COMMANDS_FLAG_DIR", str(flag_dir))
+
     for mod in ("src.app", "src.schemas", "src.runtime.mock_backend",
                 "src.runtime.mock_diag", "src.tools.diag_impls",
+                "src.tools.executor", "src.tools.audit",
+                "src.tools.approval_token",
                 "src.session.tool_call_loop", "src.routes.troubleshoot",
-                "src.routes.diag"):
+                "src.routes.diag", "src.routes.execute"):
         sys.modules.pop(mod, None)
     from src.app import app as fresh_app
     from src.runtime.mock_diag import MockDiagExecutor
     with TestClient(fresh_app) as c:
         c.app.state.tool_executor = MockDiagExecutor()
+        # Expose paths for tests that want to read the audit log
+        c.app.state.audit_log_path = str(audit_log)
+        c.app.state.security_code_path = str(sec_code)
         yield c
 
 
 @pytest.fixture
-def client_with_real_diag(schema_dir_with_all_required, monkeypatch):
+def client_with_real_diag(schema_dir_with_all_required, tmp_path, monkeypatch):
     """Variant of `client` that keeps RealDiagExecutor in place. Used by
     C3 tests that mock subprocess + state-file reads at the impl-module
     level rather than at the executor level."""
     from fastapi.testclient import TestClient
     monkeypatch.setenv("BLOX_AI_SCHEMA_DIR", str(schema_dir_with_all_required))
+    wl = _staged_whitelist(tmp_path)
+    if wl is not None:
+        monkeypatch.setenv("BLOX_AI_WHITELIST_PATH", str(wl))
+    audit_log = tmp_path / "ai-actions.jsonl"
+    monkeypatch.setenv("BLOX_AI_AUDIT_LOG_PATH", str(audit_log))
+    monkeypatch.setenv("BLOX_AI_APPROVAL_SECRET_PATH",
+                       str(tmp_path / "approval-secret"))
     for mod in ("src.app", "src.schemas", "src.runtime.mock_backend",
-                "src.tools.diag_impls",
+                "src.tools.diag_impls", "src.tools.executor",
+                "src.tools.audit", "src.tools.approval_token",
                 "src.session.tool_call_loop", "src.routes.troubleshoot",
-                "src.routes.diag"):
+                "src.routes.diag", "src.routes.execute"):
         sys.modules.pop(mod, None)
     from src.app import app as fresh_app
     with TestClient(fresh_app) as c:

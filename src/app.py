@@ -8,6 +8,7 @@ Lifespan:
      absent; real RKLLMBackend on arm64 with vendored libs — wired in C7).
   3. Initialise SessionManager (C5).
   4. Initialise RunbookLoader + install SIGHUP handler (C6).
+  5. Initialise ApprovalTokenSigner + ActionExecutor (C4 trust boundary).
 """
 from __future__ import annotations
 
@@ -21,9 +22,11 @@ from fastapi import FastAPI
 from src.runtime.mock_backend import MockBackend
 from src.runtime.runbook_loader import RunbookLoader
 from src.session.manager import SessionManager
+from src.tools.approval_token import ApprovalTokenSigner
 from src.tools.diag_impls import RealDiagExecutor
+from src.tools.executor import ActionExecutor, WhitelistError, load_whitelist
 from src.schemas import SchemaRegistry
-from src.routes import cancel, diag, feedback, health, pending, troubleshoot
+from src.routes import cancel, diag, execute, feedback, health, pending, troubleshoot
 
 
 logger = logging.getLogger("blox-ai")
@@ -48,13 +51,38 @@ async def lifespan(app: FastAPI):
         raise
     logger.info("loaded %d schemas", len(app.state.schemas))
 
+    # C4: HMAC approval-token signer + whitelist-enforced executor.
+    # Soft-fail in dev: log + leave executor unset when whitelist is
+    # missing (test fixtures stage their own). Production deploy
+    # guarantees the bind mount + exits via Docker healthcheck if
+    # /execute-action returns 500 executor_not_initialised.
+    app.state.approval_signer = ApprovalTokenSigner()
+    try:
+        whitelist = load_whitelist()
+        app.state.action_executor = ActionExecutor(
+            signer=app.state.approval_signer,
+            whitelist=whitelist,
+        )
+        logger.info("action_executor wired (whitelist_hash=%s)",
+                    whitelist.sha256_hex[:12])
+    except WhitelistError as e:
+        logger.warning("whitelist load failed (%s); /execute-action will 500", e)
+        app.state.action_executor = None
+
     # C7: try the real RKLLM backend (arm64 + librkllmrt.so + model file
     # present). Falls back to MockBackend cleanly when any of those isn't
     # present — so dev/CI/amd64 builds + lab devices without a model
     # published yet still boot the container without raising.
     from src.runtime.rkllm_runtime import try_load as _try_rkllm
     real_backend = _try_rkllm()
-    app.state.backend = real_backend if real_backend is not None else MockBackend()
+    if real_backend is None:
+        # Wire the signer into MockBackend so recommended_action events
+        # carry real HMAC tokens that /execute-action can verify.
+        app.state.backend = MockBackend(
+            action_signer=app.state.approval_signer.sign,
+        )
+    else:
+        app.state.backend = real_backend
     logger.info("backend=%s", app.state.backend.name)
 
     # C3: real per-tool implementations that read /run/fula-*.state,
@@ -125,3 +153,4 @@ app.include_router(diag.router)
 app.include_router(feedback.router)
 app.include_router(pending.router)
 app.include_router(cancel.router)
+app.include_router(execute.router)

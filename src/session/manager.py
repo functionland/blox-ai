@@ -46,6 +46,12 @@ class SessionState:
     # asyncio.Queue is bounded (maxsize=1) so a duplicate /user-reply
     # blocks server-side rather than queueing stale replies.
     reply_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=1))
+    # C4: recommended_action events the bridge has emitted on this
+    # session's stream. Keyed by action_id → {action_name, args}. The
+    # /execute-action route reads this to resolve action_name/args
+    # for the executor; the HMAC token binds to action_id, the
+    # dispatch table needs action_name + args.
+    issued_recommendations: dict[str, dict] = field(default_factory=dict)
 
 
 class SessionManager:

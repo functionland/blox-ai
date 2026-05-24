@@ -19,8 +19,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.runtime.mock_backend import MockBackend
+from src.runtime.mock_diag import MockDiagExecutor
 from src.schemas import SchemaRegistry
-from src.routes import health
+from src.routes import health, troubleshoot
 
 
 logger = logging.getLogger("blox-ai")
@@ -49,6 +50,11 @@ async def lifespan(app: FastAPI):
     app.state.backend = MockBackend()
     logger.info("backend=%s", app.state.backend.name)
 
+    # C3 will swap MockDiagExecutor for the real per-tool implementations
+    # that read /run/fula-*.state, shell out to docker, etc.
+    app.state.tool_executor = MockDiagExecutor()
+    logger.info("tool_executor=%s", app.state.tool_executor.name)
+
     yield
 
     logger.info("shutdown")
@@ -67,3 +73,4 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
+app.include_router(troubleshoot.router)

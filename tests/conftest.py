@@ -11,26 +11,44 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
 
+def _locate_fula_ota_api_dir() -> Path | None:
+    """Return the path to fula-ota's plugins/blox-ai/api directory, or None.
+
+    Priority:
+      1. BLOX_AI_FULA_OTA_SCHEMA_DIR env var (explicit override; CI + lab use this)
+      2. Sibling checkout at ../fula-ota/docker/fxsupport/linux/plugins/blox-ai/api
+      3. None (caller falls back to permissive stubs)
+    """
+    env = os.environ.get("BLOX_AI_FULA_OTA_SCHEMA_DIR")
+    if env:
+        p = Path(env)
+        if p.is_dir():
+            return p
+    sibling = (
+        _REPO_ROOT.parent / "fula-ota" / "docker" / "fxsupport" / "linux"
+        / "plugins" / "blox-ai" / "api"
+    )
+    if sibling.is_dir():
+        return sibling
+    return None
+
+
 @pytest.fixture
 def schema_dir_with_all_required(tmp_path) -> Path:
     """Stage a directory with every schema the SchemaRegistry insists on.
 
-    Sources from fula-ota when the sibling repo is present (preferred:
-    keeps tests honest against the live contract). Otherwise falls back
-    to a minimal valid stub per filename so the test suite is
-    self-contained when fula-ota isn't checked out next door.
+    Sources from fula-ota when discoverable via env var or sibling
+    checkout (preferred: keeps tests honest against the live contract).
+    Falls back to permissive stubs when neither is available — note that
+    some tests assert on schema STRICTNESS and will fail under the stub
+    fallback, which is the right signal: "set BLOX_AI_FULA_OTA_SCHEMA_DIR
+    to run the full suite."
     """
-    fula_ota_api = (
-        _REPO_ROOT.parent / "fula-ota" / "docker" / "fxsupport" / "linux"
-        / "plugins" / "blox-ai" / "api"
-    )
-    if fula_ota_api.is_dir():
+    fula_ota_api = _locate_fula_ota_api_dir()
+    if fula_ota_api is not None:
         for p in fula_ota_api.glob("*.schema.json"):
             shutil.copy(p, tmp_path / p.name)
     else:
-        # Self-contained fallback: minimal valid schema per required name.
-        # Closed (additionalProperties:false) + empty required so any
-        # payload validates.
         from src.schemas import REQUIRED_SCHEMAS
         import json
         for name in REQUIRED_SCHEMAS:
@@ -42,6 +60,13 @@ def schema_dir_with_all_required(tmp_path) -> Path:
                 "additionalProperties": True,
             }))
     return tmp_path
+
+
+def _real_schemas_in_use() -> bool:
+    """True iff the schema_dir fixture will use the REAL fula-ota schemas
+    rather than the permissive stub fallback. Tests that assert on schema
+    STRICTNESS use this to skip cleanly under stubs."""
+    return _locate_fula_ota_api_dir() is not None
 
 
 @pytest.fixture

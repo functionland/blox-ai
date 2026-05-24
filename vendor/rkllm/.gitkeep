@@ -1,0 +1,4 @@
+# Placeholder so the vendor/rkllm directory exists in git even before
+# the .so files are added (which happens in C7 once the model + runtime
+# are wired). The Dockerfile COPYs `vendor/` into the image; an empty
+# vendor/rkllm/ produces an arm64 image that falls back to MockBackend.

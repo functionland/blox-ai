@@ -1,0 +1,25 @@
+[project]
+name = "blox-ai"
+version = "0.1.0"
+description = "On-device AI troubleshooting backend for Fula Blox edge devices (RK3588 + RKLLM)."
+requires-python = ">=3.12,<3.13"
+authors = [{name = "Functionland"}]
+dependencies = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+    "jsonschema>=4.20,<5",
+    "pydantic>=2.6,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+    "httpx>=0.27,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+filterwarnings = [
+    "error::DeprecationWarning:src.*",
+]

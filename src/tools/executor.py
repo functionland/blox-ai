@@ -271,16 +271,9 @@ class ActionExecutor:
                     )
 
             # ------------------------------------------------------------------
-            # Approval token (HMAC + expiry + nonce + action_id binding)
-            # ------------------------------------------------------------------
-            try:
-                self.signer.verify(approval_token, expected_action_id=action_id)
-            except TokenError as te:
-                return self._reject(line, te.reason, started)
-            line["approval_token_valid"] = True
-
-            # ------------------------------------------------------------------
-            # Tier-3 security code (read on EVERY request, no caching)
+            # Tier-3 security code (read on EVERY request, no caching).
+            # Reordered per codex post-impl HIGH catch: check BEFORE token
+            # verify so a bad security_code doesn't burn the token's nonce.
             # ------------------------------------------------------------------
             if tier == 3:
                 file_code = read_security_code()
@@ -296,11 +289,26 @@ class ActionExecutor:
                 line["security_code_valid"] = True
 
             # ------------------------------------------------------------------
-            # Serialize + execute
+            # Acquire execution slot BEFORE consuming the token's nonce
+            # (codex post-impl HIGH catch: busy-check burning valid tokens).
+            # `asyncio.Lock` doesn't have a non-blocking acquire; we replicate
+            # via locked() peek + immediate-acquire. Inside the single-event-
+            # loop world the FastAPI app runs in, there's no yield between
+            # locked() and acquire(), so the peek's answer is authoritative.
             # ------------------------------------------------------------------
             if self._lock.locked():
                 return self._reject(line, "executor_busy", started)
+
             async with self._lock:
+                # NOW it's safe to consume the nonce: we hold the execution
+                # slot, so even if the token is valid we'll definitely run
+                # the action (no busy-burn possible).
+                try:
+                    self.signer.verify(approval_token, expected_action_id=action_id)
+                except TokenError as te:
+                    return self._reject(line, te.reason, started)
+                line["approval_token_valid"] = True
+
                 result = await self._dispatch(action_name, action_args)
 
             line["executed"] = True
@@ -316,7 +324,22 @@ class ActionExecutor:
                 line["stderr_excerpt"] = result["stderr_excerpt"]
             line["duration_ms"] = int((time.monotonic() - started) * 1000)
 
-            audit_append(line, path=self.audit_path)
+            # Codex post-impl LOW: don't ignore audit-write failure. If the
+            # log can't persist, fail closed (500) — actions running with
+            # no audit record is a worse outcome than refusing the action.
+            if not audit_append(line, path=self.audit_path):
+                logger.error("audit append returned False for executed=true line")
+                return {
+                    "request_id": request_id,
+                    "audit_line": line,
+                    "http_status": 500,
+                    "sse_event": {
+                        "type": "error",
+                        "code": "AUDIT_PERSIST_FAILED",
+                        "message": "action ran but audit log failed to persist",
+                        "recoverable": False,
+                    },
+                }
             return {
                 "request_id": request_id,
                 "audit_line": line,

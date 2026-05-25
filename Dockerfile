@@ -1,5 +1,13 @@
 # Blox AI container — multi-stage, slim Python 3.12, multi-platform (arm64 + amd64).
 #
+# BASE: Debian Bullseye (glibc 2.31). NOT Bookworm — loyal-agent precedent
+# (functionland/loyal-agent:latest works on RK3588 NPU with Bullseye base;
+# my Bookworm experiment failed with `failed to open rknpu module` even
+# with --security-opt systempaths=unconfined + --device /dev/dri + same
+# libs from loyal-agent's image. Bookworm's glibc 2.36 breaks an internal
+# librkllmrt syscall the rknpu driver depends on. Stay on Bullseye until
+# Rockchip ships a newer librkllmrt that's Bookworm-compatible.
+#
 # Stage 1 (builder): install pip deps into a venv on the target platform.
 # Stage 2 (runtime): copy venv + app + RKLLM .so files + NPU clock-fix
 # script. Runtime image stays slim; only python3 + the deps that need to be
@@ -21,7 +29,7 @@ ARG PYTHON_VERSION=3.12
 # ---------------------------------------------------------------------------
 # Builder stage
 # ---------------------------------------------------------------------------
-FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+FROM python:${PYTHON_VERSION}-slim-bullseye AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -42,7 +50,7 @@ RUN python -m venv /opt/venv \
 # ---------------------------------------------------------------------------
 # Runtime stage
 # ---------------------------------------------------------------------------
-FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+FROM python:${PYTHON_VERSION}-slim-bullseye AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

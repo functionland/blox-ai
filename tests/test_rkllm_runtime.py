@@ -439,9 +439,9 @@ def test_run_troubleshoot_with_no_runtime_yields_clean_error():
 
 
 def test_run_troubleshoot_terminates_when_model_only_emits_prose():
-    """If the model produces no verdict + no tool_calls (just prose),
-    the backend yields a synthetic 'no_verdict_emitted' verdict and
-    stops. Avoids spinning to MAX_TURNS for a non-cooperative model."""
+    """If the model produces no verdict + no tool_calls, the backend
+    INJECTS a force-verdict directive + gives the model one more chance.
+    If that ALSO produces nothing, synthesize a verdict + terminate."""
     import asyncio
     from src.runtime.rkllm_runtime import RKLLMBackend
 
@@ -458,3 +458,81 @@ def test_run_troubleshoot_terminates_when_model_only_emits_prose():
     events = asyncio.run(collect())
     verdict = next(e for e in events if e["type"] == "verdict")
     assert verdict["payload"]["root_cause"] == "no_verdict_emitted"
+
+
+def test_run_troubleshoot_force_verdict_directive_works():
+    """When the model emits prose on turn 0 but produces a verdict on
+    turn 1 (after the force-verdict directive is injected), the
+    backend yields the REAL model verdict — NOT the synthetic
+    fallback. Verifies the force-verdict path."""
+    import asyncio
+    from src.runtime.rkllm_runtime import RKLLMBackend, FORCE_VERDICT_DIRECTIVE
+
+    turn_outputs = [
+        "I am thinking about your question.",  # prose only -> triggers force-verdict
+        '<verdict>{"summary":"all good after thought","severity":"green","root_cause":"thought_through"}</verdict>',
+    ]
+    turn_idx = {"i": 0}
+    prompts_seen = []
+
+    class StagedRuntime:
+        def generate(self, prompt, timeout_s=90.0):
+            prompts_seen.append(prompt)
+            i = turn_idx["i"]
+            turn_idx["i"] = i + 1
+            return turn_outputs[i] if i < len(turn_outputs) else "(end)"
+
+    backend = RKLLMBackend(loaded=True, _runtime=StagedRuntime())
+    backend.wire_runtime_deps(tool_executor=None, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("x")]
+
+    events = asyncio.run(collect())
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert len(verdicts) == 1
+    # Real model verdict, NOT the synthetic fallback
+    assert verdicts[0]["payload"]["root_cause"] == "thought_through"
+    # The second prompt to the model contained the force-verdict directive
+    assert any(FORCE_VERDICT_DIRECTIVE in p for p in prompts_seen)
+
+
+def test_run_troubleshoot_force_verdict_at_max_turns_minus_one():
+    """Even when the model is happily calling tools but never finalizes,
+    the backend injects the force-verdict directive at MAX_TURNS-1 and
+    captures the real verdict."""
+    import asyncio
+    from src.runtime.rkllm_runtime import (
+        RKLLMBackend, FORCE_VERDICT_DIRECTIVE, MAX_TURNS,
+    )
+
+    turn_idx = {"i": 0}
+    prompts_seen = []
+
+    class ToolHappyRuntime:
+        def generate(self, prompt, timeout_s=90.0):
+            prompts_seen.append(prompt)
+            i = turn_idx["i"]
+            turn_idx["i"] = i + 1
+            # Always call diag/summary unless force-verdict directive is in prompt
+            if FORCE_VERDICT_DIRECTIVE in prompt:
+                return '<verdict>{"summary":"forced","severity":"yellow","root_cause":"max_turns_force"}</verdict>'
+            return '<tool_call>{"name":"diag/summary","arguments":{}}</tool_call>'
+
+    async def fake_executor(tool, args):
+        return {"overall": "green"}
+
+    backend = RKLLMBackend(loaded=True, _runtime=ToolHappyRuntime())
+    backend.wire_runtime_deps(tool_executor=fake_executor, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("x")]
+
+    events = asyncio.run(collect())
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert len(verdicts) == 1
+    # Real verdict (from force-verdict turn), NOT the synthetic max_turns fallback
+    assert verdicts[0]["payload"]["root_cause"] == "max_turns_force"
+    # Backend made MAX_TURNS calls (each tool-only turn iterates; final
+    # turn has the directive)
+    assert turn_idx["i"] <= MAX_TURNS

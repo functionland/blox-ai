@@ -389,34 +389,67 @@ TOOL_DEFINITIONS = [
 
 SYSTEM_PROMPT_TEMPLATE = """You are Blox AI, an on-device troubleshooting assistant for a Fula Blox edge device (RK3588 hardware).
 
-You communicate ONLY by emitting XML-tagged blocks. Do NOT use markdown code fences or any other format. Each block stands on its own line.
+# OUTPUT FORMAT — STRICT
 
-Available diagnostic tools (read-only):
+You communicate ONLY through XML-tagged blocks. NEVER use markdown code fences. NEVER use triple-backtick json. Each block on its own line.
+
+The three allowed blocks:
+
+  <tool_call>{{"name":"diag/<tool>","arguments":{{}}}}</tool_call>
+  <recommendation>{{"action_name":"<name>","args":{{...}},"reasoning":"<why>","confidence":<0-1>,"tier":<2 or 3>}}</recommendation>
+  <verdict>{{"summary":"<one sentence>","severity":"<green|yellow|red>","root_cause":"<short>"}}</verdict>
+
+# HARD RULES
+
+1. EVERY conversation MUST end with exactly ONE <verdict>.
+2. After you have called the diagnostic tools you need (typically 1-3 calls), you MUST emit a <verdict> based on the results.
+3. NEVER call tools indefinitely. After 1-2 follow-up calls, finalize.
+4. NEVER output a turn that is prose-only with no <tool_call> AND no <verdict>. Every turn must contain at least one XML block.
+
+# AVAILABLE TOOLS (read-only)
+
 {tool_list}
 
-To call a tool, emit EXACTLY:
-<tool_call>{{"name":"diag/<tool>","arguments":{{}}}}</tool_call>
+# RECOMMENDATION ACTION NAMES (only these are valid)
 
-To recommend a fix, emit EXACTLY:
-<recommendation>{{"action_name":"<name>","args":{{...}},"reasoning":"<why>","confidence":<0-1>,"tier":<2 or 3>}}</recommendation>
+- docker.restart — args: container in {{ipfs_host, ipfs_cluster, fula_go, fula_pinning, fula_gateway, fula_fxsupport}} (tier 2)
+- systemctl.restart — args: unit in {{fula.service, uniondrive.service, wireguard-support.service}} (tier 2)
+- wireguard.bounce — no args (tier 2)
+- ntp.resync — no args (tier 2)
+- restart_fula — no args (tier 2)
+- reset — no args (tier 3, destructive — only after everything else)
 
-To finalize, emit EXACTLY:
-<verdict>{{"summary":"<one sentence>","severity":"<green|yellow|red>","root_cause":"<short>"}}</verdict>
+# FULL EXAMPLE — three-turn flow
 
-Example correct response to "device feels slow":
-I will first run a summary diagnostic.
+Turn 1 (user said "device feels slow"):
+I'll start with a system summary.
 <tool_call>{{"name":"diag/summary","arguments":{{}}}}</tool_call>
 
-After receiving tool results, you may either call more tools or finalize:
-The summary shows all subsystems green.
-<verdict>{{"summary":"Device appears healthy.","severity":"green","root_cause":"no_issue_detected"}}</verdict>
+Turn 2 (after <tool_response> showing overall=red, internet=red, time=red):
+Internet and time are both red. Drilling in on internet.
+<tool_call>{{"name":"diag/internet","arguments":{{}}}}</tool_call>
 
-Allowed recommendation action_names: docker.restart (args: container in {{ipfs_host, ipfs_cluster, fula_go, fula_pinning, fula_gateway, fula_fxsupport}}), systemctl.restart (args: unit in {{fula.service, uniondrive.service, wireguard-support.service}}), wireguard.bounce (no args), ntp.resync (no args), restart_fula (tier 2), reset (tier 3, destructive).
+Turn 3 (after <tool_response> showing dns_ok=true, https_discovery_ok=false):
+Discovery is unreachable; the clock being unsynced makes it worse. Re-sync NTP first.
+<verdict>{{"summary":"Discovery unreachable + clock unsynced.","severity":"red","root_cause":"discovery_https_unreachable"}}</verdict>
+<recommendation>{{"action_name":"ntp.resync","args":{{}},"reasoning":"Many discovery checks rely on accurate timestamps; resync first.","confidence":0.8,"tier":2}}</recommendation>
 
-Runbook excerpts:
+# RUNBOOK EXCERPTS
+
 {runbook_excerpt}
 
-Be concise. Always start with diag/summary, then drill into red/yellow subsystems. Always finish with a <verdict>."""
+Be terse. Start with diag/summary unless the user named a specific symptom. Two or three tool calls, then finalize with a <verdict>."""
+
+
+# Directive injected as a user message when the model has stalled
+# (prose-only turn) OR at MAX_TURNS-1 without a verdict.
+FORCE_VERDICT_DIRECTIVE = (
+    "You have gathered enough information. STOP calling tools. Based on "
+    "the diagnostic results above, emit a <verdict> block NOW. If you "
+    "have a fix to recommend, also emit a <recommendation> block. Do "
+    "not emit any more <tool_call> blocks. Reply with the <verdict> "
+    "(and optional <recommendation>) only."
+)
 
 
 def _build_system_prompt(runbook_text: str = "", max_runbook_chars: int = 2000) -> str:
@@ -664,9 +697,21 @@ class RKLLMBackend:
         history: list[dict] = [{"role": "user", "content": prompt}]
 
         emitted_verdict = False
+        force_verdict_attempted = False
         loop = asyncio.get_event_loop()
 
         for turn in range(MAX_TURNS):
+            # Last-chance: at MAX_TURNS-1 without a verdict, inject the
+            # force-verdict directive so the model knows this is its
+            # final shot to finalize.
+            if (
+                not emitted_verdict
+                and not force_verdict_attempted
+                and turn == MAX_TURNS - 1
+            ):
+                history.append({"role": "user", "content": FORCE_VERDICT_DIRECTIVE})
+                force_verdict_attempted = True
+
             full_prompt = _build_chat_prompt(system_prompt, history)
 
             try:
@@ -781,9 +826,20 @@ class RKLLMBackend:
             # End conditions: verdict emitted AND either recommendations or no more tool calls
             if emitted_verdict and (recommendations or not tool_calls):
                 return
-            # If no progress (no tool calls + no verdict), stop to avoid an infinite spin
+
+            # Prose-only turn (no tool_calls + no verdict + no
+            # recommendations): the model is stuck. If we haven't tried
+            # the force-verdict directive yet, inject it + give the
+            # model one more chance. Otherwise terminate with synthetic
+            # verdict.
             if not tool_calls and not verdict and not recommendations:
-                # The model produced only prose; treat as terminal
+                if not force_verdict_attempted and turn < MAX_TURNS - 1:
+                    history.append({
+                        "role": "user",
+                        "content": FORCE_VERDICT_DIRECTIVE,
+                    })
+                    force_verdict_attempted = True
+                    continue
                 if not emitted_verdict:
                     yield {
                         "type": "verdict",

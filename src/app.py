@@ -91,6 +91,15 @@ async def lifespan(app: FastAPI):
     app.state.tool_executor = RealDiagExecutor()
     logger.info("tool_executor=%s", app.state.tool_executor.name)
 
+    # C7-final: wire the executor + signer into RKLLMBackend so it can
+    # run diag tools inline + mint real HMAC approval tokens.
+    if real_backend is not None and hasattr(real_backend, "wire_runtime_deps"):
+        real_backend.wire_runtime_deps(
+            tool_executor=app.state.tool_executor,
+            action_signer=app.state.approval_signer.sign,
+            runbook_loader=None,  # rewired below once runbook_loader exists
+        )
+
     # C5: in-memory session registry for /troubleshoot conversations.
     # 30-min sliding TTL, 50-session cap, LRU eviction. Lost on container
     # restart by design (matches HMAC approval-secret rotation).
@@ -113,6 +122,17 @@ async def lifespan(app: FastAPI):
         events_log_path=events_log_path,
     )
     app.state.runbook_loader.load_initial()
+
+    # C7-final: now the runbook loader exists, re-wire RKLLMBackend so
+    # its system prompt uses the loaded runbook content (SIGHUP reloads
+    # pick up automatically — the backend re-reads via the loader's
+    # get_text() on every turn).
+    if real_backend is not None and hasattr(real_backend, "wire_runtime_deps"):
+        real_backend.wire_runtime_deps(
+            tool_executor=app.state.tool_executor,
+            action_signer=app.state.approval_signer.sign,
+            runbook_loader=app.state.runbook_loader,
+        )
 
     def _on_sighup(signum, frame):  # noqa: ARG001
         logger.info("SIGHUP received; reloading runbook")

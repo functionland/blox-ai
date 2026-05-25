@@ -85,11 +85,14 @@ async def troubleshoot(req: TroubleshootRequest, request: Request) -> Response:
         session_id=session.session_id,
     )
 
+    backend_handles_tools = getattr(backend, "consumes_tool_results", False)
+
     async def sse_stream():
         try:
             async for event in stream_troubleshoot(
                 backend_events, tool_executor, validator,
                 session=session,
+                backend_handles_tools=backend_handles_tools,
             ):
                 yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
         except Exception:

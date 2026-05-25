@@ -50,6 +50,7 @@ async def stream_troubleshoot(
     tool_executor: ToolExecutor,
     validator: jsonschema.Draft202012Validator,
     session: SessionState | None = None,
+    backend_handles_tools: bool = False,
 ) -> AsyncIterator[dict]:
     """Bridge generator. Yields validated event dicts ready to wrap as SSE.
 
@@ -60,6 +61,11 @@ async def stream_troubleshoot(
     When `session` is None, user_question events are passed through
     without waiting — callers that don't use SessionManager get the
     pre-C5 behaviour (model asks, no reply machinery).
+
+    When `backend_handles_tools=True` (RKLLMBackend), the bridge passes
+    `tool_call` events through without invoking `tool_executor` —
+    the backend already ran the tool and emitted the matching
+    `tool_result` event itself.
     """
     async for event in backend_events:
         if not _validate(event, validator):
@@ -70,7 +76,7 @@ async def stream_troubleshoot(
 
         evtype = event.get("type")
 
-        if evtype == "tool_call":
+        if evtype == "tool_call" and not backend_handles_tools:
             try:
                 payload = await tool_executor(
                     event["payload"]["tool"],

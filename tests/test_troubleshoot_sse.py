@@ -324,8 +324,14 @@ def client_with_broken_backend(schema_dir_with_all_required, monkeypatch):
 
 
 def test_schema_invalid_backend_event_emits_synthetic_error(client_with_broken_backend):
-    """If the backend somehow emits a malformed event, the bridge MUST
-    swallow it and emit an `error` event with code SCHEMA_VIOLATION.
+    """If the backend somehow emits a malformed NON-tool_call event,
+    the bridge emits a recoverable error event and continues iterating
+    (no return) — so a single bad event doesn't kill the whole session.
+
+    Bug fix 2026-05-26: previously the bridge `return`ed on first
+    schema-invalid event, which killed any in-flight troubleshooting
+    session (user saw '[SCHEMA_VIOLATION]' instead of recommendations).
+    Now: invalid event → recoverable error + keep streaming.
 
     Requires the REAL sse_events.schema.json (the permissive stub
     fallback would accept anything). Skips when the stub is in use.
@@ -344,8 +350,76 @@ def test_schema_invalid_backend_event_emits_synthetic_error(client_with_broken_b
         f"expected an error event; got {len(events)} event(s): "
         f"{[e.get('type') for e in events]}"
     )
-    assert err["code"] == "SCHEMA_VIOLATION"
-    assert err["recoverable"] is False
+    # The bad event was a thought (not a tool_call) so the bridge marks
+    # the recovery as ongoing — recoverable=True.
+    assert err["code"] == "SCHEMA_VIOLATION_RECOVERED", (
+        f"expected SCHEMA_VIOLATION_RECOVERED, got {err.get('code')}"
+    )
+    assert err["recoverable"] is True
+
+
+@pytest.fixture
+def client_with_bad_tool_name_backend(schema_dir_with_all_required, monkeypatch):
+    """Backend whose first event is a tool_call with a NON-WHITELISTED
+    tool name ('diag/discovery'). Mirrors the user's lab observation
+    2026-05-26 where the 1.5B Qwen hallucinated a tool that doesn't
+    exist + the bridge killed the whole stream."""
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("BLOX_AI_SCHEMA_DIR", str(schema_dir_with_all_required))
+    import sys
+    for mod in ("src.app", "src.schemas", "src.runtime.mock_backend",
+                "src.runtime.mock_diag", "src.session.tool_call_loop",
+                "src.routes.troubleshoot"):
+        sys.modules.pop(mod, None)
+    from src.app import app as fresh_app
+
+    class BadToolBackend:
+        name = "bad-tool"
+        loaded = True
+        consumes_tool_results = False
+        def status_snapshot(self): return {}
+        async def run_troubleshoot(self, prompt, session_id=None):
+            yield {"type": "tool_call", "call_id": "rk-0-0",
+                   "payload": {"tool": "diag/discovery", "args": {}}}
+
+    with TestClient(fresh_app) as c:
+        c.app.state.backend = BadToolBackend()
+        yield c
+
+
+def test_schema_invalid_tool_call_yields_synthetic_tool_result(
+    client_with_bad_tool_name_backend,
+):
+    """Regression guard 2026-05-26: if the LLM hallucinates a tool name
+    not in the closed enum (e.g. 'diag/discovery'), the bridge MUST
+    synthesize a tool_result with ok=false + a clear 'unknown tool'
+    error — so the LLM has a chance to self-correct on the next turn,
+    AND the stream keeps flowing.
+
+    Before fix: bridge `return`ed on first invalid tool_call → user
+    saw [SCHEMA_VIOLATION] and no further events. Lab observed:
+    LLM emitted `{"tool": "diag/discovery"}` and entire session bombed.
+    """
+    from .conftest import _real_schemas_in_use
+    if not _real_schemas_in_use():
+        pytest.skip("real sse_events.schema.json required")
+    r = _post_troubleshoot(client_with_bad_tool_name_backend)
+    events = _events_from_response(r)
+    types = [e.get("type") for e in events]
+    err = next((e for e in events if e.get("type") == "error"), None)
+    tr = next((e for e in events if e.get("type") == "tool_result"), None)
+    assert err is not None, f"expected error event; saw types: {types}"
+    assert err["recoverable"] is True, (
+        "schema-invalid tool_call must NOT kill the stream; bridge "
+        "should yield recoverable error and continue"
+    )
+    assert tr is not None, (
+        "expected synthetic tool_result with ok=false so the LLM can "
+        "read the failure and pick a valid tool next turn"
+    )
+    assert tr["ok"] is False
+    assert tr["call_id"] == "rk-0-0"
+    assert "diag/discovery" in (tr.get("error") or "")
 
 
 def test_unknown_tool_in_executor_fails_open_with_ok_false(

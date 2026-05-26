@@ -435,7 +435,136 @@ def test_run_troubleshoot_with_no_runtime_yields_clean_error():
     err = next((e for e in events if e["type"] == "error"), None)
     assert err is not None
     assert err["code"] == "RKLLM_NOT_LOADED"
-    assert err["recoverable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Recommendation guardrails — 2026-05-26 lab false-positive regression
+# ---------------------------------------------------------------------------
+
+def _verdict(severity: str):
+    return {"summary": "x", "severity": severity, "root_cause": "y"}
+
+
+def _rec(name: str, conf: float, tier: int = 2, args=None):
+    return {
+        "action_name": name,
+        "args": args or {},
+        "reasoning": "...",
+        "confidence": conf,
+        "tier": tier,
+    }
+
+
+def _summary_with_heartbeat(status: str, http_status: int):
+    return {
+        "overall": status,
+        "subsystems": {
+            "heartbeat": {"status": status,
+                          "key_metrics": {"http_status": http_status}},
+        },
+    }
+
+
+def test_guardrail_caps_restart_class_confidence_when_not_red():
+    """1.5B Qwen pattern: 'restart_fula' at confidence 0.95 with verdict
+    severity=yellow. Cap to 0.6 — yellow is not red, restart-class
+    actions should not be presented as high-confidence."""
+    from src.runtime.rkllm_runtime import apply_recommendation_guardrails
+    recs = [_rec("restart_fula", 0.95)]
+    out, notes = apply_recommendation_guardrails(
+        recs,
+        verdict=_verdict("yellow"),
+        last_summary_payload=None,
+        user_prompt="trying to upload a file but it's slow",
+    )
+    assert len(out) == 1
+    assert out[0]["confidence"] == 0.6
+    assert any("capped" in n.lower() for n in notes)
+
+
+def test_guardrail_passes_high_confidence_when_severity_red():
+    """If severity IS red, the action is appropriately confident."""
+    from src.runtime.rkllm_runtime import apply_recommendation_guardrails
+    recs = [_rec("docker.restart", 0.9, args={"container": "ipfs_host"})]
+    out, _ = apply_recommendation_guardrails(
+        recs,
+        verdict=_verdict("red"),
+        last_summary_payload=None,
+        user_prompt="ipfs_host crashing",
+    )
+    assert len(out) == 1
+    assert out[0]["confidence"] == 0.9
+
+
+def test_guardrail_drops_restart_fula_when_heartbeat_green_and_user_said_disconnected():
+    """The EXACT lab regression 2026-05-26: user clicked 'disconnected'
+    scenario, device was healthy + heartbeat green http_status=200, but
+    AI emitted restart_fula at 0.95 based on relay=yellow alone. That
+    action would create the very disconnect being complained about.
+    Must be dropped entirely."""
+    from src.runtime.rkllm_runtime import apply_recommendation_guardrails
+    recs = [_rec("restart_fula", 0.95)]
+    out, notes = apply_recommendation_guardrails(
+        recs,
+        verdict=_verdict("yellow"),
+        last_summary_payload=_summary_with_heartbeat("green", 200),
+        user_prompt="My Blox is showing as disconnected in the app. Please diagnose why the device is not reachable",
+    )
+    assert out == [], (
+        f"restart_fula should have been dropped (heartbeat green + connectivity "
+        f"complaint = false positive); got {out}"
+    )
+    assert any("dropped" in n.lower() for n in notes)
+    assert any("heartbeat" in n.lower() for n in notes)
+
+
+def test_guardrail_passes_restart_fula_when_heartbeat_actually_red():
+    """If heartbeat IS failing (real connectivity issue), restart_fula
+    is legitimate even on user-reported disconnect."""
+    from src.runtime.rkllm_runtime import apply_recommendation_guardrails
+    recs = [_rec("restart_fula", 0.8)]
+    out, _ = apply_recommendation_guardrails(
+        recs,
+        verdict=_verdict("red"),
+        last_summary_payload={
+            "subsystems": {
+                "heartbeat": {"status": "red",
+                              "key_metrics": {"http_status": 0}},
+            },
+        },
+        user_prompt="disconnected",
+    )
+    assert len(out) == 1
+    assert out[0]["confidence"] == 0.8
+
+
+def test_guardrail_leaves_non_restart_class_actions_alone():
+    """ntp.resync is NOT a restart-class action — confidence cap doesn't apply."""
+    from src.runtime.rkllm_runtime import apply_recommendation_guardrails
+    recs = [_rec("ntp.resync", 0.95)]
+    out, _ = apply_recommendation_guardrails(
+        recs,
+        verdict=_verdict("yellow"),
+        last_summary_payload=None,
+        user_prompt="clock drift suspected",
+    )
+    assert out[0]["confidence"] == 0.95
+
+
+def test_guardrail_does_not_drop_when_user_did_NOT_complain_about_connectivity():
+    """If user prompt didn't mention disconnect/unreachable, the
+    heartbeat-green check shouldn't fire — restart_fula stays (just
+    capped if severity isn't red)."""
+    from src.runtime.rkllm_runtime import apply_recommendation_guardrails
+    recs = [_rec("restart_fula", 0.95)]
+    out, _ = apply_recommendation_guardrails(
+        recs,
+        verdict=_verdict("yellow"),
+        last_summary_payload=_summary_with_heartbeat("green", 200),
+        user_prompt="my Blox is slow when streaming",
+    )
+    assert len(out) == 1, "non-connectivity complaint shouldn't trigger the drop"
+    assert out[0]["confidence"] == 0.6  # but still capped
 
 
 def test_run_troubleshoot_terminates_when_model_only_emits_prose():

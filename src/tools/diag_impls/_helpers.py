@@ -73,6 +73,10 @@ def https_head(url: str, timeout_s: float = 5.0) -> tuple[bool, int | None, floa
     `ok` is True iff the request completed AND status is 2xx/3xx. Latency
     is wall-clock from request start to response. Stdlib urllib — no
     runtime requests/httpx dependency.
+
+    Note: this answers "did the request SUCCEED?" — for reachability
+    checks, prefer https_reachable() (treats 4xx/5xx as 'host is up
+    and responded, you just can't access this resource').
     """
     import time
     start = time.monotonic()
@@ -86,6 +90,39 @@ def https_head(url: str, timeout_s: float = 5.0) -> tuple[bool, int | None, floa
         latency = (time.monotonic() - start) * 1000
         return False, e.code, latency
     except (urllib.error.URLError, OSError, TimeoutError):
+        latency = (time.monotonic() - start) * 1000
+        return False, None, latency
+
+
+def https_reachable(url: str, timeout_s: float = 5.0) -> tuple[bool, int | None, float]:
+    """Reachability check — distinguishes 'host is unreachable' from
+    'host responded with an HTTP error'.
+
+    `ok` is True iff we got ANY valid HTTP response (2xx, 3xx, 4xx, or
+    5xx). A 403/404/500 means the server is alive, TCP+TLS worked, the
+    network path is fine — we just don't have access to that specific
+    URL. `ok` is False ONLY when we got NO HTTP response (DNS failure,
+    connection refused, TLS handshake fail, timeout).
+
+    Bug fix 2026-05-26: previously diag/internet used https_head() with
+    `ok = 200 <= status < 400`, so a 403 on https://discovery.fula.network/relays
+    (which requires POST not HEAD) was reported as 'discovery
+    unreachable' — pure false positive. Lab observed: HTTP 403, TLS
+    ok, ping 3ms RTT, yet diag/internet returned discovery_https_ok=false.
+    """
+    import time
+    start = time.monotonic()
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            latency = (time.monotonic() - start) * 1000
+            return True, resp.status, latency
+    except urllib.error.HTTPError as e:
+        # Server responded with an HTTP error — host IS reachable.
+        latency = (time.monotonic() - start) * 1000
+        return True, e.code, latency
+    except (urllib.error.URLError, OSError, TimeoutError):
+        # No HTTP response at all (DNS / TCP / TLS / timeout).
         latency = (time.monotonic() - start) * 1000
         return False, None, latency
 

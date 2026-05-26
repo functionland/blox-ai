@@ -405,6 +405,37 @@ The three allowed blocks:
 2. After you have called the diagnostic tools you need (typically 1-3 calls), you MUST emit a <verdict> based on the results.
 3. NEVER call tools indefinitely. After 1-2 follow-up calls, finalize.
 4. NEVER output a turn that is prose-only with no <tool_call> AND no <verdict>. Every turn must contain at least one XML block.
+5. **ANY action you suggest MUST be emitted as a <recommendation> XML block — NEVER as a markdown numbered list, bullet, or table.** If the user can't tap "Approve" on it, it didn't happen. Prose-only suggestions are invisible to the app. Translate every fix you have in mind into one <recommendation> block per fix.
+6. Read tool_response JSON FIELD BY FIELD. Do NOT confuse `internet.latency_ms_avg` with a clock offset. Do NOT call a subsystem "red" if its `status` field says "green". Quote the actual field name you're basing your conclusion on.
+7. NEVER use markdown headings (###), markdown bold (**...**), or numbered lists like "1. ntp.resync — ...". Those render as plain text in the chat; only <recommendation> blocks produce an Approve button.
+8. **If the user reports a symptom but the diagnostic data CONTRADICTS it, ASK before acting.** Specifically:
+     - User says "device disconnected" / "not reachable" / "app can't see my blox" BUT `heartbeat.status` is "green" with `http_status: 200`. → Device IS reachable from the cloud (heartbeat is the canonical "I'm alive" signal posting to discovery.fula.network). The disconnect they see is almost certainly phone-side (app cache, NetInfo wrong, WiFi switched, captive portal). DO NOT recommend restart_fula. INSTEAD emit a <user_question> like: {{"question":"Your device is currently posting heartbeats successfully (heartbeat.status=green, http_status=200). The connection issue may be phone-side. What error message do you see, and is your phone on the same WiFi as your Blox?","options":["Same WiFi","Cellular","Different WiFi","Don't know"]}}
+     - User says "slow" but `containers.status: green, oom_count: 0, storage.status: green`. → ASK what specifically is slow.
+     - User says "not earning" but `relay.reservation_count > 0` AND `heartbeat.status: green`. → Device IS connected. ASK if they've actually joined a pool.
+9. **NEVER emit a tier-2 or tier-3 destructive action (`restart_fula`, `docker.restart`, `systemctl.restart`, `wireguard.bounce`, `reset`) with confidence > 0.7 when severity is "yellow" or "green".** Yellow signals can be normal — relay=yellow on a LAN-only device is expected. Acting on yellow with high confidence creates self-fulfilling problems (the action briefly DISCONNECTS the device, "confirming" the false diagnosis). Confidence > 0.7 on these actions requires severity="red" AND a specific failing subsystem named in the reasoning.
+10. `relay.reservation_count: 0` is NOT a problem on its own — it only matters if the user is trying to be reached from outside their LAN. `wireguard.active: false` is NOT a problem unless the user explicitly set up WG. Mention these only as "informational" in your verdict, never as the root cause unless other evidence points to them.
+
+# BAD vs GOOD examples
+
+❌ BAD — prose recommendations get NO Approve button, user can take no action:
+
+  ### Tier 2 Actions:
+  1. **ntp.resync** - Resync the clock.
+  2. **docker.restart container=ipfs_host** - Restart the container.
+
+✅ GOOD — each recommendation is its own XML block:
+
+  <recommendation>{{"action_name":"ntp.resync","args":{{}},"reasoning":"Clock is unsynced.","confidence":0.85,"tier":2}}</recommendation>
+  <recommendation>{{"action_name":"docker.restart","args":{{"container":"ipfs_host"}},"reasoning":"ipfs_host restart-looping.","confidence":0.75,"tier":2}}</recommendation>
+
+❌ BAD — making up a field:
+
+  "Time Status: Clock offset is significant (93 ms)"
+  (when tool_response actually said `time.status: green, synced: true` and the 93 was `internet.latency_ms_avg`)
+
+✅ GOOD — quote what you actually read:
+
+  "time.status is green (synced=true). internet.latency_ms_avg is 93ms — that's network latency, not a clock offset."
 
 # AVAILABLE TOOLS (read-only)
 
@@ -593,6 +624,98 @@ def parse_recommendations(raw_text: str) -> list[dict]:
     return out
 
 
+# Tier-2/3 destructive actions that should NOT be recommended at high
+# confidence unless severity is "red". Empirically observed (2026-05-26
+# lab): 1.5B Qwen pattern-matches "user said disconnected → relay
+# yellow → restart_fula at 95%" even when heartbeat is green
+# (contradicting evidence of actual reachability). The post-processor
+# below caps confidence to 0.6 on these names when the verdict's
+# severity is not red, AND additionally suppresses them entirely when
+# heartbeat is green but the user's prompt mentioned a connectivity
+# complaint (the AI is acting on false-positive contradictory data).
+RESTART_CLASS_ACTIONS = frozenset({
+    "restart_fula", "reset", "wireguard.bounce",
+    "docker.restart", "systemctl.restart",
+})
+
+
+def apply_recommendation_guardrails(
+    recommendations: list[dict],
+    verdict: Optional[dict],
+    last_summary_payload: Optional[dict] = None,
+    user_prompt: Optional[str] = None,
+) -> tuple[list[dict], list[str]]:
+    """Cap or drop misbehaving recommendations from the model output.
+
+    Two rules (in order):
+
+    1. CONFIDENCE CAP: restart-class action (restart_fula, reset,
+       wireguard.bounce, docker.restart, systemctl.restart) with
+       confidence > 0.7 AND verdict.severity != "red" → cap confidence
+       at 0.6. Reasoning: yellow/green severity + high-confidence
+       destructive action is the false-positive pattern.
+
+    2. CONTRADICTION SUPPRESS: if the user's prompt mentions a
+       CONNECTIVITY symptom ("disconnect", "not reachable", "can't see",
+       "offline") BUT the last diag/summary's heartbeat.status is
+       "green" with http_status 200, suppress restart_fula entirely.
+       The device IS reachable from the cloud; restarting it would
+       create the very disconnect the user is complaining about.
+
+    Returns (filtered_recommendations, list_of_human_readable_reasons)
+    so the caller can log/surface why something was dropped or capped.
+    """
+    notes: list[str] = []
+    severity = (verdict or {}).get("severity") if verdict else None
+
+    # Did the user actually complain about connectivity?
+    prompt_lc = (user_prompt or "").lower()
+    is_connectivity_complaint = any(
+        kw in prompt_lc
+        for kw in ("disconnect", "not reachable", "unreachable",
+                   "can't see", "cannot see", "offline", "can't reach",
+                   "cannot reach", "showing as disconnected", "shows offline")
+    )
+    # Heartbeat ground truth: device IS reachable iff posted recent 200.
+    hb = (last_summary_payload or {}).get("subsystems", {}).get("heartbeat", {})
+    heartbeat_green_with_200 = (
+        hb.get("status") == "green"
+        and hb.get("key_metrics", {}).get("http_status") == 200
+    )
+
+    out: list[dict] = []
+    for rec in recommendations:
+        name = rec.get("action_name", "")
+        conf = float(rec.get("confidence", 0.5))
+
+        # Rule 2: drop restart_fula on contradiction (most aggressive).
+        if (
+            name == "restart_fula"
+            and is_connectivity_complaint
+            and heartbeat_green_with_200
+        ):
+            notes.append(
+                f"dropped action={name!r} (confidence {conf:.2f}): user reported "
+                f"a connectivity issue but heartbeat.status=green http_status=200, "
+                f"so device IS reachable — restart_fula would create a real "
+                f"disconnect from a non-existent problem"
+            )
+            continue
+
+        # Rule 1: cap restart-class confidence when severity is not red.
+        if name in RESTART_CLASS_ACTIONS and conf > 0.7 and severity != "red":
+            capped = 0.6
+            notes.append(
+                f"capped action={name!r} confidence from {conf:.2f} to "
+                f"{capped:.2f}: severity={severity!r} is not red, so this "
+                f"action should not be presented as high-confidence"
+            )
+            rec = {**rec, "confidence": capped}
+
+        out.append(rec)
+    return out, notes
+
+
 def strip_blocks(raw_text: str) -> str:
     """Remove tool_call/verdict/recommendation blocks. What's left is
     the model's prose 'thought' content. Also strips any UNCLOSED
@@ -699,6 +822,11 @@ class RKLLMBackend:
         emitted_verdict = False
         force_verdict_attempted = False
         loop = asyncio.get_event_loop()
+        # Last diag/summary result + the user's original prompt are needed
+        # by the recommendation guardrails to detect false positives like
+        # "user says disconnected but heartbeat is green → suppress restart_fula".
+        last_summary_payload: Optional[dict] = None
+        original_user_prompt = prompt
 
         for turn in range(MAX_TURNS):
             # Last-chance: at MAX_TURNS-1 without a verdict, inject the
@@ -793,6 +921,12 @@ class RKLLMBackend:
                         )
                     yield tr_event
 
+                    # Capture the diag/summary result for the guardrail
+                    # check below. Lets us detect "heartbeat green but
+                    # user said disconnected" false-positive pattern.
+                    if ok and tc["tool"] == "diag/summary" and isinstance(result, dict):
+                        last_summary_payload = result
+
                 # Add tool responses to history for the next turn
                 history.append({
                     "role": "tool",
@@ -803,6 +937,20 @@ class RKLLMBackend:
             if verdict and not emitted_verdict:
                 emitted_verdict = True
                 yield {"type": "verdict", "payload": verdict}
+
+            # Server-side guardrails on recommendations (caps + drops
+            # the false-positive patterns the 1.5B model produces).
+            # Logged to stderr so operators can see WHY a recommendation
+            # was dropped/capped.
+            if recommendations:
+                recommendations, guardrail_notes = apply_recommendation_guardrails(
+                    recommendations,
+                    verdict=verdict,
+                    last_summary_payload=last_summary_payload,
+                    user_prompt=original_user_prompt,
+                )
+                for note in guardrail_notes:
+                    logger.warning("recommendation guardrail: %s", note)
 
             # Emit recommendations with real HMAC tokens
             if recommendations and self._action_signer is not None:

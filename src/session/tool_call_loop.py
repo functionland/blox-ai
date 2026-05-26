@@ -69,8 +69,50 @@ async def stream_troubleshoot(
     """
     async for event in backend_events:
         if not _validate(event, validator):
-            yield _schema_violation_error(event)
-            return
+            # Bug fix 2026-05-26: previously this killed the stream
+            # (`return`), so a single hallucinated event from the model
+            # — e.g. `tool_call` with an invalid tool name like
+            # `diag/discovery` — bombed the entire session. The user
+            # saw `[SCHEMA_VIOLATION]` instead of any recommendations.
+            #
+            # New behavior: if the offending event is a tool_call,
+            # synthesize a tool_result with ok=false + an error message
+            # naming the bad tool. This lets the backend's tool-call
+            # loop continue and gives the LLM a chance to self-correct
+            # (it can read "unknown tool 'diag/discovery'" and retry
+            # with a valid name). For OTHER event types (verdict,
+            # thought, etc.) we still surface a non-fatal error event
+            # but don't end the stream — the backend may yield more
+            # valid events afterward.
+            invalid_evtype = event.get("type", "<missing>")
+            invalid_call_id = event.get("call_id")
+            yield _validation_error_event(
+                offending_type=invalid_evtype,
+                call_id=invalid_call_id,
+                fatal=False,
+            )
+            if invalid_evtype == "tool_call" and invalid_call_id:
+                bad_tool = (
+                    event.get("payload", {}).get("tool")
+                    if isinstance(event.get("payload"), dict) else None
+                )
+                synth = {
+                    "type": "tool_result",
+                    "call_id": invalid_call_id,
+                    "ok": False,
+                    "payload": None,
+                    "error": (
+                        f"unknown or unsupported tool name "
+                        f"{bad_tool!r}. Pick one of the diag/* tools "
+                        f"listed in your system prompt."
+                    ),
+                }
+                # Best-effort: emit ONLY if it itself validates.
+                # Otherwise we'd loop indefinitely.
+                if _validate(synth, validator):
+                    yield synth
+            # Move on to the next event from the backend.
+            continue
 
         yield event
 
@@ -176,6 +218,32 @@ def _schema_violation_error(offending: dict) -> dict:
             f"(type={offending.get('type', '<missing>')!s})"
         ),
         "recoverable": False,
+    }
+
+
+def _validation_error_event(
+    offending_type: str,
+    call_id: str | None,
+    fatal: bool,
+) -> dict:
+    """Non-fatal variant of the schema-violation error.
+
+    Used when the bridge can RECOVER from an invalid backend event
+    (e.g. by synthesizing a tool_result with ok=false). Marked
+    `recoverable: True` so the UI knows to keep the chat alive and
+    not show a terminal-error state.
+    """
+    msg = (
+        f"backend emitted an invalid {offending_type!s} event; "
+        f"continuing — the model may self-correct."
+    )
+    if call_id:
+        msg += f" (call_id={call_id!r})"
+    return {
+        "type": "error",
+        "code": "SCHEMA_VIOLATION_RECOVERED" if not fatal else "SCHEMA_VIOLATION",
+        "message": msg,
+        "recoverable": not fatal,
     }
 
 

@@ -93,9 +93,25 @@ def _scorecard(name: str, raw: dict) -> dict:
             "key_metrics": {"synced": bool(raw.get("synced"))},
         }
     if name == "power":
+        # Lab observed 2026-05-26: a SINGLE undervoltage event in 24h
+        # would flip status=red and feed the AI a panic-level signal,
+        # which then dominated the verdict. Real PSU failures show
+        # repeated events; isolated transients (one bad cable wiggle,
+        # one boot brownout) should be a yellow, not a red.
+        #
+        # Tiers:
+        #   0   events  → green
+        #   1-2 events  → yellow (note but don't panic; could be transient)
+        #   3+  events  → red (real PSU issue, recommend power-cable check)
         ue = raw.get("undervoltage_events_24h", 0)
+        if ue == 0:
+            status = "green"
+        elif ue <= 2:
+            status = "yellow"
+        else:
+            status = "red"
         return {
-            "status": "red" if ue > 0 else "green",
+            "status": status,
             "key_metrics": {
                 "uptime_s": raw.get("uptime_s", 0),
                 "undervoltage_events_24h": ue,

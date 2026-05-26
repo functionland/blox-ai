@@ -50,9 +50,11 @@ def _validate(payload: dict, defname: str):
 # ---------------------------------------------------------------------------
 
 def test_internet_happy_path_all_ok():
+    """google.com via https_head, discovery via https_reachable."""
     from src.tools.diag_impls import internet as mod
     with patch.object(mod, "dns_lookup", return_value=True), \
-         patch.object(mod, "https_head", return_value=(True, 200, 42.0)):
+         patch.object(mod, "https_head", return_value=(True, 200, 42.0)), \
+         patch.object(mod, "https_reachable", return_value=(True, 200, 42.0)):
         r = mod.diag_internet()
     assert r["dns_ok"] is True
     assert r["https_google_ok"] is True
@@ -64,23 +66,50 @@ def test_internet_happy_path_all_ok():
 def test_internet_no_dns_marks_everything_down():
     from src.tools.diag_impls import internet as mod
     with patch.object(mod, "dns_lookup", return_value=False), \
-         patch.object(mod, "https_head", return_value=(False, None, 0.0)):
+         patch.object(mod, "https_head", return_value=(False, None, 0.0)), \
+         patch.object(mod, "https_reachable", return_value=(False, None, 0.0)):
         r = mod.diag_internet()
     assert r["dns_ok"] is False
     _validate(r, "internet")
 
 
 def test_internet_captive_portal_heuristic_fires():
-    """DNS OK + google OK + discovery DOWN + low latency → likely captive."""
+    """DNS OK + google OK + discovery completely UNREACHABLE (no HTTP
+    response at all) + low latency → likely captive."""
     from src.tools.diag_impls import internet as mod
-    def fake_head(url, timeout_s=5.0):
-        if "google" in url:
-            return True, 200, 30.0
-        return False, None, 20.0
     with patch.object(mod, "dns_lookup", return_value=True), \
-         patch.object(mod, "https_head", side_effect=fake_head):
+         patch.object(mod, "https_head", return_value=(True, 200, 30.0)), \
+         patch.object(mod, "https_reachable", return_value=(False, None, 20.0)):
         r = mod.diag_internet()
     assert r["captive_portal_likely"] is True
+
+
+def test_internet_discovery_403_is_reachable_not_captive():
+    """Regression guard 2026-05-26: lab observed
+    https://discovery.fula.network/relays returning HTTP 403 (HEAD
+    not allowed by the server — only POST). Before the fix, this was
+    classified as discovery_https_ok=False AND captive_portal_likely=True
+    — both false positives that led the AI to diagnose 'discovery
+    unreachable' when the server was actually fine.
+
+    With the https_reachable fix, ANY HTTP response (including 403)
+    counts as 'reachable' — only no-response-at-all counts as down."""
+    from src.tools.diag_impls import internet as mod
+    with patch.object(mod, "dns_lookup", return_value=True), \
+         patch.object(mod, "https_head", return_value=(True, 200, 80.0)), \
+         patch.object(mod, "https_reachable", return_value=(True, 403, 5.0)):
+        r = mod.diag_internet()
+    # The 403 from discovery still counts as REACHABLE.
+    assert r["https_discovery_ok"] is True, (
+        "discovery server responded with HTTP 403 — that means it's reachable, "
+        "not down. The AI must not be told 'discovery unreachable' just because "
+        "we can't HEAD /relays."
+    )
+    # And captive-portal must NOT fire when discovery responded.
+    assert r["captive_portal_likely"] is False, (
+        "captive-portal heuristic fired despite discovery returning a real HTTP "
+        "response — should only fire when discovery is COMPLETELY unreachable"
+    )
 
 
 # ---------------------------------------------------------------------------

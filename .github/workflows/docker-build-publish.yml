@@ -14,6 +14,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      extra_tag:
+        description: |
+          Additional Docker tag to publish from this ref (e.g.
+          "rollback-2026-05-26"). Use to mint immutable rollback tags
+          from a known-good commit. Leave blank for normal runs.
+        required: false
+        type: string
+        default: ""
 
 env:
   IMAGE_NAME: functionland/blox-ai
@@ -51,7 +60,23 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=raw,value=test,enable=${{ github.ref == 'refs/heads/main' }}
+            # :release tracks main as the production-default tag.
+            # Compose default in the fula-ota plugin is
+            # ${BLOX_AI_IMAGE_TAG:-release}, so without this devices on a
+            # fresh install would hit a Docker Hub 404. Safety preconditions
+            # (documented in plan-B-production-consolidation.md):
+            #   - main is branch-protected (PR + review + green CI required)
+            #   - immutable rollback-YYYYMMDD tag exists as fallback,
+            #     minted via workflow_dispatch + extra_tag input
+            #   - canary devices pin to an immutable sha256 digest (not
+            #     a moving tag) during the D4 observation window
+            # Replace with semver-promote step when versioning lands.
+            # (The previous :test raw-tag alias is dropped — :release is
+            # now the single production tag and canaries pin by digest.)
+            type=raw,value=release,enable=${{ github.ref == 'refs/heads/main' }}
+            # workflow_dispatch extra tag — used to mint immutable rollback
+            # tags from a chosen commit (publish-then-smoke per plan D0.3).
+            type=raw,value=${{ github.event.inputs.extra_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.extra_tag != '' }}
 
       - name: Build and push multi-platform Docker image
         uses: docker/build-push-action@v5

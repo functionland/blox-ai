@@ -26,6 +26,49 @@
 
 ARG PYTHON_VERSION=3.12
 
+# Pinned to the rknn-llm git tag whose librkllmrt.so reports the same
+# runtime version (1.1.4) the lab device's NPU driver expects. SHAs are
+# what raw.githubusercontent.com returns today (2026-05-26) — pinning
+# them means a future upstream rewrite of the same tag (rare but possible)
+# fails the build instead of silently shipping a different binary.
+#
+# Verified end-to-end on lab pi@192.168.2.159 (RK3588, Armbian, kernel
+# 6.1.115-vendor-rk35xx): rkllm_init succeeds, real Qwen 2.5 3B streaming
+# through /troubleshoot works.
+ARG RKLLM_VERSION=release-v1.1.4
+ARG RKLLMRT_URL=https://raw.githubusercontent.com/airockchip/rknn-llm/release-v1.1.4/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so
+ARG RKLLMRT_SHA256=3cef353105c3bfd31f99c4963fce8498d2fac633d845633c904f523b7c3bcd0a
+ARG RKNNRT_URL=https://raw.githubusercontent.com/airockchip/rknn-llm/release-v1.1.4/examples/rkllm_multimodel_demo/deploy/3rdparty/librknnrt/Linux/librknn_api/aarch64/librknnrt.so
+ARG RKNNRT_SHA256=1170e5f99f2db7ed4d3a4c2bdbed941b7363bd090e0c28b4e210f40614327911
+
+# ---------------------------------------------------------------------------
+# Stage 0: fetch Rockchip RKLLM runtime binaries (arm64 only).
+#
+# Runs on $BUILDPLATFORM (the GH runner, usually amd64) — emulated arm64
+# wget is slow + flaky. We're only fetching 11.4 MB of .so files into a
+# staging dir; the COPY --from picks the right files for the target arch.
+#
+# On amd64 builds /libs/ stays empty → runtime falls back to MockBackend
+# (intended: amd64 has no NPU).
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM alpine:3.20 AS rkllm-libs
+ARG TARGETARCH
+ARG RKLLMRT_URL
+ARG RKLLMRT_SHA256
+ARG RKNNRT_URL
+ARG RKNNRT_SHA256
+RUN apk add --no-cache wget ca-certificates && mkdir -p /libs
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        echo "Fetching Rockchip RKLLM libs for arm64 target..." && \
+        wget -q -O /libs/librkllmrt.so "$RKLLMRT_URL" && \
+        echo "${RKLLMRT_SHA256}  /libs/librkllmrt.so" | sha256sum -c && \
+        wget -q -O /libs/librknnrt.so "$RKNNRT_URL" && \
+        echo "${RKNNRT_SHA256}  /libs/librknnrt.so" | sha256sum -c && \
+        ls -la /libs/ ; \
+    else \
+        echo "Skipping RKLLM libs for $TARGETARCH (MockBackend will be used at runtime)" ; \
+    fi
+
 # ---------------------------------------------------------------------------
 # Builder stage
 # ---------------------------------------------------------------------------
@@ -71,10 +114,13 @@ WORKDIR /app
 # Application source
 COPY src/ /app/src/
 
-# Vendored RKLLM binaries (copied from loyal-agent — binary blobs from Rockchip)
-# Only present on arm64 builds; on amd64 the runtime falls back to MockBackend.
-# Use a guarded COPY pattern so the build doesn't fail when vendor/rkllm/ is empty.
+# Vendored RKLLM binaries: downloaded from the official Rockchip repo
+# in the rkllm-libs stage above (only populated on arm64 builds). The
+# repo's vendor/ dir is otherwise empty (.gitkeep) so we can also COPY
+# anything that gets added locally (e.g. the fix_freq_rk3588.sh script
+# checked in alongside .gitkeep) without conflicts.
 COPY vendor/ /app/vendor/
+COPY --from=rkllm-libs /libs/ /app/vendor/rkllm/
 
 # The RKLLM .so files live in /lib so the dlopen() ctypes call finds them.
 # We do this at runtime via the entrypoint (only if files exist) so the same

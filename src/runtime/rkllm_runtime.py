@@ -363,8 +363,16 @@ class RKLLMRuntime:
         # streaming SSE path that emits tokens as they arrive (current
         # generate() blocks until the full turn completes).
         max_new_tokens: int = 768,
-        temperature: float = 0.6,
-        top_k: int = 20,
+        # Lower temperature + tighter top_k for STRUCTURED-OUTPUT
+        # adherence. Lab observation 2026-05-27: at temp=0.6/top_k=20
+        # the model produced narrative prose ("diag/summary") instead
+        # of the trained XML format ("<tool_call>{...}</tool_call>").
+        # The training distribution heavily favours XML in the relevant
+        # positions; lower entropy = the model follows that mode more
+        # consistently. Trade-off is slightly less variety in reasoning
+        # prose, acceptable for a structured tool-calling task.
+        temperature: float = 0.3,
+        top_k: int = 5,
         top_p: float = 0.8,
     ) -> None:
         p = RKLLMParam()

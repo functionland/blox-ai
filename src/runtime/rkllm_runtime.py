@@ -352,17 +352,14 @@ class RKLLMRuntime:
         # If a future conversion bumps the model's limit, raise this
         # value in lock-step.
         max_context_len: int = 4096,
-        # max_new_tokens lowered to 768 (2026-05-27 lab test). On RK3588
-        # NPU, Qwen 3 1.7B in thinking mode generates ~5-7 tokens/sec.
-        # 3072 would cap a turn at ~7-10 minutes which exceeds phone-
-        # app UX timeouts (and even our per-token 90s wait stretches
-        # the user's perception). 768 caps at ~2-3 minutes — long but
-        # bounded. The model occasionally truncates verbose verdicts
-        # at this limit, which the synthetic-verdict fallback handles
-        # gracefully. Raise back once we have a faster model or a real
-        # streaming SSE path that emits tokens as they arrive (current
-        # generate() blocks until the full turn completes).
-        max_new_tokens: int = 768,
+        # max_new_tokens budget per turn on RK3588 NPU. At ~5-7 tps in
+        # thinking mode: 1500 tokens ≈ 3-5 minutes per turn. The
+        # synthetic-verdict fallback in run_troubleshoot handles
+        # truncation gracefully when the model runs out of budget
+        # mid-output. Lower if phone UX timeouts demand quicker
+        # responses; raise once the SSE pipeline streams tokens
+        # incrementally (current generate() blocks until turn done).
+        max_new_tokens: int = 1500,
         # Lower temperature + tighter top_k for STRUCTURED-OUTPUT
         # adherence. Lab observation 2026-05-27: at temp=0.6/top_k=20
         # the model produced narrative prose ("diag/summary") instead

@@ -1045,6 +1045,13 @@ class RKLLMBackend:
     # prefix injection + per-turn history rewriting.
     _enable_thinking: bool = False
 
+    # Tracks whether rkllm_set_chat_template has been called on this
+    # backend's runtime handle. Lab observation 2026-05-27: calling
+    # set_chat_template per session breaks the SECOND rkllm_run with
+    # return code -1. Calling it ONCE at first-session start sticks
+    # for the lifetime of the runtime handle.
+    _template_set: bool = False
+
     # Tells the bridge: don't intercept tool_call events; we handle them.
     consumes_tool_results: bool = True
 
@@ -1115,32 +1122,26 @@ class RKLLMBackend:
 
         # Per-turn role-based content for v1.2.3.
         #
-        # Inject system prompt via rkllm_set_chat_template with the
-        # canonical Qwen 3 markers (no <think>\n added — that broke
-        # generation in the lab on commit 609debc). The runtime wraps
-        # our system in <|im_start|>system\n...<|im_end|>\n, each user
-        # turn in <|im_start|>user\n...<|im_end|>\n, and opens
-        # assistant via <|im_start|>assistant\n. <|im_end|> stays as
-        # the per-turn stop token via the runtime's built-in handling.
-        try:
-            self._runtime._lib.rkllm_set_chat_template.restype = ctypes.c_int
-            self._runtime._lib.rkllm_set_chat_template.argtypes = [
-                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-            ]
-            # Hold byte buffers in locals (ctypes c_char_p doesn't own).
-            sys_bytes = (
-                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            ).encode("utf-8")
-            prefix_bytes = b"<|im_start|>user\n"
-            postfix_bytes = b"<|im_end|>\n<|im_start|>assistant\n"
-            self._runtime._lib.rkllm_set_chat_template(
-                self._runtime._handle, sys_bytes, prefix_bytes, postfix_bytes,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("rkllm_set_chat_template failed: %s", e)
-
+        # NO rkllm_set_chat_template — lab observation 2026-05-27 was
+        # that calling set_chat_template (even once) broke the second
+        # multi-turn rkllm_run with code -1. Runtime appears to use a
+        # state-dependent template internally that's incompatible with
+        # KV-cache-preserving second calls after a per-session template
+        # set. Without set_chat_template the runtime uses the model's
+        # built-in Qwen 3 template (which DOES support keep_history=1
+        # across rkllm_run calls).
+        #
+        # System prompt is inlined into the first user message instead.
+        # The 174-example fine-tune included SYSTEM_PROMPT_TEMPLATE in
+        # every training sample, so the model recognises the rules even
+        # when they arrive as inlined user content. At temperature=0.3
+        # the model adheres to the trained XML output format.
+        first_turn_content = (
+            f"Instructions:\n{system_prompt}\n\n"
+            f"Request: {prompt}"
+        )
         next_role: str = "user"
-        next_content: str = prompt
+        next_content: str = first_turn_content
         next_keep_history: int = 0   # 0 on first turn; 1 thereafter
 
         for turn in range(MAX_TURNS):

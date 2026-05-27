@@ -77,12 +77,34 @@ def _good_phone_context() -> dict:
     }
 
 
-def test_phone_context_unknown_session_returns_404(client):
+def test_phone_context_unknown_session_auto_creates(client):
+    """Behavior change 2026-05-27: phone-context with an unknown
+    session_id now AUTO-CREATES the session (matches the prime-then-
+    troubleshoot pattern + survives container restart). Previously
+    returned 404 with `session_not_found` and the phone app showed
+    "[http-not-found] Session not found" to the user.
+
+    Real-world cases this unblocks:
+      - User taps "Share my phone's context" before starting
+        /troubleshoot — the app's pre-generated session_id should
+        prime the session; the next /troubleshoot with that same
+        session_id finds the session with phone_context already
+        attached.
+      - Container restarted between sessions; the app's cached
+        session_id is no longer in the in-memory map. Auto-create
+        avoids a confusing "Session not found" error in the UI.
+    """
+    mgr = client.app.state.session_manager
+    assert mgr.get("nope") is None
     r = client.post("/troubleshoot/phone-context", json={
         "session_id": "nope",
         "phone_context": _good_phone_context(),
     })
-    assert r.status_code == 404
+    assert r.status_code == 200
+    # Session was created with the supplied id + phone_context attached
+    s = mgr.get("nope")
+    assert s is not None
+    assert s.phone_context == _good_phone_context()
 
 
 def test_phone_context_validates_body_envelope(client):

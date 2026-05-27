@@ -167,15 +167,35 @@ async def user_reply(req: UserReplyRequest, request: Request) -> Response:
 async def phone_context(req: PhoneContextRequest, request: Request) -> Response:
     """Phase 11 contract: in-memory only. Validates body against
     phone_context.schema.json (the inner shape). On validation error,
-    sanitize SSID/BSSID/IP before any log line."""
+    sanitize SSID/BSSID/IP before any log line.
+
+    Auto-creates the session if the supplied session_id doesn't exist
+    (idempotent prime-then-troubleshoot pattern). This handles two
+    real-world cases observed in production:
+      1. User taps "Share my phone's context" BEFORE starting a
+         /troubleshoot session — the app has generated a UUID and
+         wants to attach the phone snapshot to it; the next
+         /troubleshoot with that same session_id will find the
+         pre-primed session with phone_context already loaded.
+      2. Container restarted between sessions — the app's cached
+         session_id was valid before the restart but the in-memory
+         session map is now empty. Auto-create avoids a confusing
+         "Session not found" error in the UI; the user gets the same
+         outcome as starting fresh, just labelled with the existing
+         session_id.
+    """
     schemas = request.app.state.schemas
     session_mgr = request.app.state.session_manager
     session = session_mgr.get(req.session_id)
     if session is None:
-        return JSONResponse(
-            status_code=404,
-            content=_error_body("session_not_found"),
+        # Don't 404 — create the session with the supplied id. Slide
+        # TTL via touch() at the end so the auto-created session has
+        # a full 30 min before pruning.
+        logger.info(
+            "session_auto_created_via_phone_context session=%s",
+            req.session_id,
         )
+        session = session_mgr.create(session_id=req.session_id)
     pc_validator = schemas.validator_for("phone_context.schema.json")
     errors = list(pc_validator.iter_errors(req.phone_context))
     if errors:

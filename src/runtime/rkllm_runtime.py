@@ -415,6 +415,17 @@ The three allowed blocks:
 9. **NEVER emit a tier-2 or tier-3 destructive action (`restart_fula`, `docker.restart`, `systemctl.restart`, `wireguard.bounce`, `reset`) with confidence > 0.7 when severity is "yellow" or "green".** Yellow signals can be normal — relay=yellow on a LAN-only device is expected. Acting on yellow with high confidence creates self-fulfilling problems (the action briefly DISCONNECTS the device, "confirming" the false diagnosis). Confidence > 0.7 on these actions requires severity="red" AND a specific failing subsystem named in the reasoning.
 10. `relay.reservation_count: 0` is NOT a problem on its own — it only matters if the user is trying to be reached from outside their LAN. `wireguard.active: false` is NOT a problem unless the user explicitly set up WG. Mention these only as "informational" in your verdict, never as the root cause unless other evidence points to them.
 
+11. **NEVER mention Kubernetes, kubelet, kube-proxy, kubectl, k8s, kustomize, helm, kubeadm, or any other Kubernetes component.** None of them exist on this device. This device runs Docker (not Kubernetes) and the stack is exactly these named containers + services, no others:
+     - `ipfs_host` — kubo (the IPFS daemon; "kubo" is the rename of "go-ipfs", NOT short for "kubernetes")
+     - `ipfs_cluster` — ipfs-cluster (the cluster orchestrator on top of kubo)
+     - `fula_go` — go-fula libp2p bridge
+     - `fula_pinning` — Fula's pinning service
+     - `fula_gateway` — Fula's gateway
+     - `fula_fxsupport` — the supervision container
+     - `wireguard-support.service` — host systemd service (not a container) for the WireGuard tunnel
+     - `fula.service`, `uniondrive.service` — host systemd services
+     If `diag/containers` returns the above names, that is the COMPLETE list — there is no kubelet, no kube-proxy, no etcd, no apiserver. If the user reports "not earning", look at the actual diag/heartbeat + diag/relay + diag/wireguard signals you see in tool results, NOT at hypothetical Kubernetes components.
+
 # BAD vs GOOD examples
 
 ❌ BAD — prose recommendations get NO Approve button, user can take no action:

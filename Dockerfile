@@ -26,20 +26,31 @@
 
 ARG PYTHON_VERSION=3.12
 
-# Pinned to the rknn-llm git tag whose librkllmrt.so reports the same
-# runtime version (1.1.4) the lab device's NPU driver expects. SHAs are
-# what raw.githubusercontent.com returns today (2026-05-26) — pinning
-# them means a future upstream rewrite of the same tag (rare but possible)
-# fails the build instead of silently shipping a different binary.
+# Pinned to release-v1.2.3 (2025-11-24) — first runtime with full
+# Qwen 3 support. The 1.1.4 runtime that shipped previously can't load
+# Qwen3ForCausalLM at all (toolkit returns "Not support Qwen3ForCausalLM!");
+# 1.2.3 adds Qwen3, function-calling, thinking-mode chat template
+# parsing, multi-batch inference + the GRQ Int4 quantization optimizer.
+# Toolkit and runtime MUST match — if a future model is converted with
+# a newer toolkit, bump this version + rebuild the image.
+#
+# Migration history:
+#   - release-v1.1.4: original (Qwen 2.5 3B then 1.5B W8A8)
+#   - release-v1.2.3: current (Qwen 3 1.7B W8A8 with thinking mode)
+#
+# librknnrt directory rename in 1.2.x: examples/rkllm_multimodel_demo/
+# became examples/multimodal_model_demo/ (note "rkllm_" prefix dropped,
+# "multimodel" -> "multimodal"). Both files are AARCH64-only; on x86
+# builds the rkllm-libs stage is a no-op + MockBackend takes over.
 #
 # Verified end-to-end on lab pi@192.168.2.159 (RK3588, Armbian, kernel
-# 6.1.115-vendor-rk35xx): rkllm_init succeeds, real Qwen 2.5 3B streaming
-# through /troubleshoot works.
-ARG RKLLM_VERSION=release-v1.1.4
-ARG RKLLMRT_URL=https://raw.githubusercontent.com/airockchip/rknn-llm/release-v1.1.4/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so
-ARG RKLLMRT_SHA256=3cef353105c3bfd31f99c4963fce8498d2fac633d845633c904f523b7c3bcd0a
-ARG RKNNRT_URL=https://raw.githubusercontent.com/airockchip/rknn-llm/release-v1.1.4/examples/rkllm_multimodel_demo/deploy/3rdparty/librknnrt/Linux/librknn_api/aarch64/librknnrt.so
-ARG RKNNRT_SHA256=1170e5f99f2db7ed4d3a4c2bdbed941b7363bd090e0c28b4e210f40614327911
+# 6.1.115-vendor-rk35xx): rkllm_init succeeds with 1.2.3 ABI; Qwen3 1.7B
+# W8A8 streaming through /troubleshoot works.
+ARG RKLLM_VERSION=release-v1.2.3
+ARG RKLLMRT_URL=https://raw.githubusercontent.com/airockchip/rknn-llm/release-v1.2.3/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so
+ARG RKLLMRT_SHA256=bbcf28a8666b9fbf7361d6aad892b957920f6ea92400c074899b48f4c5b2c96f
+ARG RKNNRT_URL=https://raw.githubusercontent.com/airockchip/rknn-llm/release-v1.2.3/examples/multimodal_model_demo/deploy/3rdparty/librknnrt/Linux/librknn_api/aarch64/librknnrt.so
+ARG RKNNRT_SHA256=d31fc19c85b85f6091b2bd0f6af9d962d5264a4e410bfb536402ec92bac738e8
 
 # ---------------------------------------------------------------------------
 # Stage 0: fetch Rockchip RKLLM runtime binaries (arm64 only).

@@ -62,13 +62,33 @@ DEFAULT_MODEL_FILENAME = "qwen3-1.7b-rk3588-w8a8.rkllm"
 
 
 # ---------------------------------------------------------------------------
-# ctypes structures
+# ctypes structures — RKLLM v1.2.3 ABI
 # ---------------------------------------------------------------------------
+#
+# These mirror the C structs in rkllm-runtime/Linux/librkllm_api/include/rkllm.h
+# at the release-v1.2.3 tag. The Rockchip runtime is strict about struct
+# layout — any drift here causes silent corruption OR explicit init errors
+# ("The n_batch must be between 1 and 100, but got 0" is the canary).
+#
+# v1.1.4 → v1.2.3 ABI changes captured here:
+#   RKLLMExtendParam: added embed_flash, enabled_cpus_num, enabled_cpus_mask,
+#                     n_batch, use_cross_attn; reserved shrunk 112 → 104
+#   RKLLMParam:       added n_keep between top_k and top_p
+#   RKLLMInput:       restructured — role + enable_thinking + input_type
+#                     prefixed BEFORE the union (previously just input_mode)
+#   RKLLMInferParam:  added keep_history
+#   RKLLMResult:      added token_id + logits + perf fields
+#   Callback:         returns int now (was void)
 
 class RKLLMExtendParam(ctypes.Structure):
     _fields_ = [
         ("base_domain_id", ctypes.c_int32),
-        ("reserved", ctypes.c_uint8 * 112),
+        ("embed_flash", ctypes.c_int8),
+        ("enabled_cpus_num", ctypes.c_int8),
+        ("enabled_cpus_mask", ctypes.c_uint32),
+        ("n_batch", ctypes.c_uint8),
+        ("use_cross_attn", ctypes.c_int8),
+        ("reserved", ctypes.c_uint8 * 104),
     ]
 
 
@@ -78,6 +98,7 @@ class RKLLMParam(ctypes.Structure):
         ("max_context_len", ctypes.c_int32),
         ("max_new_tokens", ctypes.c_int32),
         ("top_k", ctypes.c_int32),
+        ("n_keep", ctypes.c_int32),  # NEW in v1.2.3
         ("top_p", ctypes.c_float),
         ("temperature", ctypes.c_float),
         ("repeat_penalty", ctypes.c_float),
@@ -109,11 +130,15 @@ class RKLLMTokenInput(ctypes.Structure):
     ]
 
 
-class RKLLMMultiModelInput(ctypes.Structure):
+class RKLLMMultiModalInput(ctypes.Structure):
+    """v1.2.3 added image_width, image_height + n_image fields."""
     _fields_ = [
         ("prompt", ctypes.c_char_p),
         ("image_embed", ctypes.POINTER(ctypes.c_float)),
         ("n_image_tokens", ctypes.c_size_t),
+        ("n_image", ctypes.c_size_t),
+        ("image_width", ctypes.c_size_t),
+        ("image_height", ctypes.c_size_t),
     ]
 
 
@@ -122,13 +147,17 @@ class RKLLMInputUnion(ctypes.Union):
         ("prompt_input", ctypes.c_char_p),
         ("embed_input", RKLLMEmbedInput),
         ("token_input", RKLLMTokenInput),
-        ("multimodal_input", RKLLMMultiModelInput),
+        ("multimodal_input", RKLLMMultiModalInput),
     ]
 
 
 class RKLLMInput(ctypes.Structure):
+    """v1.2.3 restructured: role + enable_thinking + input_type now
+    prefix the union. Previously: just input_mode (int)."""
     _fields_ = [
-        ("input_mode", ctypes.c_int),
+        ("role", ctypes.c_char_p),
+        ("enable_thinking", ctypes.c_bool),
+        ("input_type", ctypes.c_int),  # RKLLMInputType enum
         ("input_data", RKLLMInputUnion),
     ]
 
@@ -149,6 +178,7 @@ class RKLLMInferParam(ctypes.Structure):
         ("mode", ctypes.c_int),
         ("lora_params", ctypes.POINTER(RKLLMLoraParam)),
         ("prompt_cache_params", ctypes.POINTER(RKLLMPromptCacheParam)),
+        ("keep_history", ctypes.c_int),  # NEW in v1.2.3
     ]
 
 
@@ -160,11 +190,33 @@ class RKLLMResultLastHiddenLayer(ctypes.Structure):
     ]
 
 
+class RKLLMResultLogits(ctypes.Structure):
+    _fields_ = [
+        ("logits", ctypes.POINTER(ctypes.c_float)),
+        ("vocab_size", ctypes.c_int),
+        ("num_tokens", ctypes.c_int),
+    ]
+
+
+class RKLLMPerfStat(ctypes.Structure):
+    _fields_ = [
+        ("prefill_time_ms", ctypes.c_float),
+        ("prefill_tokens", ctypes.c_int),
+        ("generate_time_ms", ctypes.c_float),
+        ("generate_tokens", ctypes.c_int),
+        ("memory_usage_mb", ctypes.c_float),
+    ]
+
+
 class RKLLMResult(ctypes.Structure):
+    """v1.2.3 added token_id, logits, perf fields. Drop the legacy
+    `size` field (no longer in C struct)."""
     _fields_ = [
         ("text", ctypes.c_char_p),
-        ("size", ctypes.c_int),
+        ("token_id", ctypes.c_int32),
         ("last_hidden_layer", RKLLMResultLastHiddenLayer),
+        ("logits", RKLLMResultLogits),
+        ("perf", RKLLMPerfStat),
     ]
 
 
@@ -212,9 +264,10 @@ class RKLLMLoadError(RuntimeError):
     pass
 
 
-# C callback signature
+# C callback signature — v1.2.3 returns int (was void in v1.1.4).
+# The callback MUST return 0 to indicate normal continuation.
 _CALLBACK_TYPE = ctypes.CFUNCTYPE(
-    None,
+    ctypes.c_int,
     ctypes.POINTER(RKLLMResult),
     ctypes.c_void_p,
     ctypes.c_int,
@@ -268,20 +321,25 @@ class RKLLMRuntime:
 
     # Callback runs on a C-spawned thread; ctypes acquires the GIL for us
     # before invoking. Push the token text + state to the queue; the
-    # generate() caller drains.
+    # generate() caller drains. v1.2.3 callback MUST return 0 (was void
+    # in v1.1.4).
     def _on_token(self, result_ptr, userdata, state):
-        if state == RKLLM_RUN_NORMAL or state == RKLLM_RUN_WAITING:
-            try:
-                text_bytes = result_ptr.contents.text
-                if text_bytes:
-                    self._token_queue.put(("token", text_bytes))
-            except Exception:  # noqa: BLE001
-                # Never raise from the C callback - would corrupt rkllm state
-                pass
-        elif state == RKLLM_RUN_FINISH:
-            self._token_queue.put(("finish", None))
-        elif state == RKLLM_RUN_ERROR:
-            self._token_queue.put(("error", None))
+        try:
+            if state == RKLLM_RUN_NORMAL or state == RKLLM_RUN_WAITING:
+                try:
+                    text_bytes = result_ptr.contents.text
+                    if text_bytes:
+                        self._token_queue.put(("token", text_bytes))
+                except Exception:  # noqa: BLE001
+                    # Never raise from the C callback - would corrupt rkllm state
+                    pass
+            elif state == RKLLM_RUN_FINISH:
+                self._token_queue.put(("finish", None))
+            elif state == RKLLM_RUN_ERROR:
+                self._token_queue.put(("error", None))
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
 
     def init_model(
         self,
@@ -298,21 +356,39 @@ class RKLLMRuntime:
         top_p: float = 0.8,
     ) -> None:
         p = RKLLMParam()
+        ctypes.memset(ctypes.byref(p), 0, ctypes.sizeof(p))
         p.model_path = self.model_path.encode("utf-8")
         p.max_context_len = max_context_len
         p.max_new_tokens = max_new_tokens
         p.top_k = top_k
+        # n_keep: number of KV cache tokens to keep at the start when the
+        # context window shifts. -1 = use runtime default (typically the
+        # system-prompt portion). New required field in v1.2.3.
+        p.n_keep = -1
         p.top_p = top_p
         p.temperature = temperature
         p.repeat_penalty = 1.1
         p.frequency_penalty = 0.0
         p.presence_penalty = 0.0
+        p.mirostat = 0
+        p.mirostat_tau = 5.0
+        p.mirostat_eta = 0.1
         p.skip_special_token = True
         p.is_async = False
         p.img_start = b""
         p.img_end = b""
         p.img_content = b""
+        # Extend params — v1.2.3 added required NPU configuration here.
         p.extend_param.base_domain_id = 0
+        p.extend_param.embed_flash = 1  # embed from flash (lower RAM)
+        p.extend_param.enabled_cpus_num = 4
+        # RK3588 big cores are 4-7 (A76); little cores 0-3 (A55). Pin
+        # inference to big cores for best per-token latency.
+        p.extend_param.enabled_cpus_mask = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
+        # n_batch=1 — single-sample inference. v1.2.3 rejects 0 explicitly
+        # ("The n_batch must be between 1 and 100, but got 0").
+        p.extend_param.n_batch = 1
+        p.extend_param.use_cross_attn = 0
 
         rc = self._lib.rkllm_init(
             ctypes.byref(self._handle),
@@ -321,6 +397,29 @@ class RKLLMRuntime:
         )
         if rc != 0:
             raise RKLLMLoadError(f"rkllm_init returned {rc}")
+
+        # Override the runtime's built-in Qwen 3 chat template with empty
+        # strings — our Python code already builds the full ChatML
+        # (system+user+assistant+tool envelope, including the `<think>\n`
+        # prefix injection for thinking mode). With empty system/prefix/
+        # postfix, the runtime passes our pre-formatted prompt through
+        # verbatim and does NOT double-wrap or double-inject `<think>`.
+        try:
+            self._lib.rkllm_set_chat_template.restype = ctypes.c_int
+            self._lib.rkllm_set_chat_template.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+            ]
+            rc = self._lib.rkllm_set_chat_template(
+                self._handle, b"", b"", b"",
+            )
+            if rc != 0:
+                logger.warning("rkllm_set_chat_template returned %d "
+                                "(non-fatal; runtime template stays default)", rc)
+        except AttributeError:
+            # Older runtime without the symbol — would only happen if the
+            # Dockerfile didn't get the v1.2.3 .so. Logged + continue.
+            logger.warning("librkllmrt.so does not export rkllm_set_chat_template; "
+                            "thinking-mode wrapping may double-wrap")
 
     def generate(self, prompt: str, timeout_s: float = 90.0) -> str:
         """Blocking. Run inference for `prompt`, drain the callback queue,
@@ -335,11 +434,23 @@ class RKLLMRuntime:
                     break
 
             inp = RKLLMInput()
-            inp.input_mode = RKLLM_INPUT_PROMPT
+            ctypes.memset(ctypes.byref(inp), 0, ctypes.sizeof(inp))
+            # v1.2.3 restructured RKLLMInput. We use "user" role for the
+            # full ChatML envelope (since rkllm_set_chat_template was
+            # called with empty wrappers during init_model, the runtime
+            # passes our prompt through verbatim).
+            inp.role = b"user"
+            # We handle `<think>\n` prefix injection ourselves in
+            # _build_chat_prompt — keep this False to avoid double-think.
+            inp.enable_thinking = False
+            inp.input_type = RKLLM_INPUT_PROMPT
             inp.input_data.prompt_input = prompt.encode("utf-8")
             infer = RKLLMInferParam()
             ctypes.memset(ctypes.byref(infer), 0, ctypes.sizeof(infer))
             infer.mode = RKLLM_INFER_GENERATE
+            # We manage multi-turn history ourselves (rebuild full prompt
+            # per turn) → tell the runtime to discard its own KV history.
+            infer.keep_history = 0
 
             # rkllm_run blocks (is_async=False). The callback fires inline
             # for each token. When the model finishes, the callback is

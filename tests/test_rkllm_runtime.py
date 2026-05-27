@@ -362,7 +362,7 @@ def test_run_troubleshoot_end_to_end_with_mock_runtime():
     turn_idx = {"i": 0}
 
     class FakeRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             i = turn_idx["i"]
             turn_idx["i"] = i + 1
             if i < len(turn_outputs):
@@ -575,7 +575,7 @@ def test_run_troubleshoot_terminates_when_model_only_emits_prose():
     from src.runtime.rkllm_runtime import RKLLMBackend
 
     class ProseOnlyRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             return "Just some thinking, nothing else."
 
     backend = RKLLMBackend(loaded=True, _runtime=ProseOnlyRuntime())
@@ -605,7 +605,7 @@ def test_run_troubleshoot_force_verdict_directive_works():
     prompts_seen = []
 
     class StagedRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             prompts_seen.append(prompt)
             i = turn_idx["i"]
             turn_idx["i"] = i + 1
@@ -807,7 +807,7 @@ def test_run_troubleshoot_strips_think_from_history_in_qwen3_mode():
     prompts_seen = []
 
     class FakeRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             prompts_seen.append(prompt)
             i = turn_idx["i"]
             turn_idx["i"] = i + 1
@@ -856,7 +856,7 @@ def test_run_troubleshoot_hides_think_content_from_thought_event():
     from src.runtime.rkllm_runtime import RKLLMBackend
 
     class FakeRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             # Turn output: CoT inside the think block, then ONLY a
             # verdict block. No post-think prose. The thought event
             # should fall back to the synthetic "Analyzing..." marker.
@@ -900,7 +900,7 @@ def test_run_troubleshoot_surfaces_post_think_prose_when_present():
     from src.runtime.rkllm_runtime import RKLLMBackend
 
     class FakeRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             return (
                 "HIDDEN_COT_CONTENT</think>\n"
                 "VISIBLE_PROSE_AFTER_THINK that explains what's happening.\n"
@@ -942,7 +942,7 @@ def test_run_troubleshoot_force_verdict_at_max_turns_minus_one():
     prompts_seen = []
 
     class ToolHappyRuntime:
-        def generate(self, prompt, timeout_s=90.0):
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
             prompts_seen.append(prompt)
             i = turn_idx["i"]
             turn_idx["i"] = i + 1

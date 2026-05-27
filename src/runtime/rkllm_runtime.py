@@ -406,33 +406,62 @@ class RKLLMRuntime:
         if rc != 0:
             raise RKLLMLoadError(f"rkllm_init returned {rc}")
 
-        # Override the runtime's built-in Qwen 3 chat template with empty
-        # strings — our Python code already builds the full ChatML
-        # (system+user+assistant+tool envelope, including the `<think>\n`
-        # prefix injection for thinking mode). With empty system/prefix/
-        # postfix, the runtime passes our pre-formatted prompt through
-        # verbatim and does NOT double-wrap or double-inject `<think>`.
-        try:
-            self._lib.rkllm_set_chat_template.restype = ctypes.c_int
-            self._lib.rkllm_set_chat_template.argtypes = [
-                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-            ]
-            rc = self._lib.rkllm_set_chat_template(
-                self._handle, b"", b"", b"",
-            )
-            if rc != 0:
-                logger.warning("rkllm_set_chat_template returned %d "
-                                "(non-fatal; runtime template stays default)", rc)
-        except AttributeError:
-            # Older runtime without the symbol — would only happen if the
-            # Dockerfile didn't get the v1.2.3 .so. Logged + continue.
-            logger.warning("librkllmrt.so does not export rkllm_set_chat_template; "
-                            "thinking-mode wrapping may double-wrap")
+        # IMPORTANT — DO NOT call rkllm_set_chat_template here.
+        #
+        # Lab-observed bug 2026-05-27: calling
+        # rkllm_set_chat_template(handle, "", "", "") to "pass our
+        # pre-formatted ChatML through verbatim" disabled the
+        # runtime's built-in <|im_end|> stop-token handling. Without
+        # that, the model generated forever (or until max_new_tokens),
+        # producing fictitious continuations like
+        #     Calling diag/summary...
+        #     tool returned data
+        #     user: My BloX is not earning...
+        #     [model imagining the next user message]
+        # because the model emitted <|im_end|> to end its turn but the
+        # runtime never recognized it as a stop signal.
+        #
+        # The runtime's own warning was explicit:
+        #   "Calling rkllm_set_chat_template will disable the internal
+        #    automatic chat template parsing, including enable_thinking.
+        #    Make sure your custom prompt is complete and valid."
+        #
+        # Without the override, the runtime applies the model's
+        # built-in Qwen 3 chat template, which:
+        #   - knows <|im_end|> is the per-turn stop token
+        #   - handles role transitions (user/tool/assistant)
+        #   - respects the enable_thinking flag on RKLLMInput
+        # so role-based input via rkllm_run (role="user"/"tool" +
+        # raw content) Just Works. See generate() below for the new
+        # role-based contract.
 
-    def generate(self, prompt: str, timeout_s: float = 90.0) -> str:
-        """Blocking. Run inference for `prompt`, drain the callback queue,
-        return the full decoded text. Raises RKLLMLoadError on rkllm_run
-        failure or callback-reported error."""
+    def generate(
+        self,
+        prompt: str,
+        role: str = "user",
+        enable_thinking: bool = False,
+        keep_history: int = 0,
+        timeout_s: float = 90.0,
+    ) -> str:
+        """Blocking. Run a single role-based inference. Returns the full
+        decoded text from the runtime callback up to the next <|im_end|>.
+
+        v1.2.3 contract:
+          - role: "user" or "tool" (the model knows the rest)
+          - enable_thinking: True wraps the assistant turn in <think>\\n
+            via the runtime's built-in Qwen 3 chat template
+          - keep_history: 0 = fresh KV cache (first turn of a session);
+                          1 = append to prior KV cache (subsequent turns
+                          in a multi-turn loop)
+
+        DO NOT pass pre-formatted ChatML as `prompt` — the runtime applies
+        its built-in template, so the prompt should be raw message content
+        for the given role. For the FIRST turn of a session, we currently
+        concatenate the system rules into the user content (see
+        RKLLMBackend.run_troubleshoot) since v1.2.3's role enum doesn't
+        document a "system" role and set_chat_template's system arg
+        disables thinking-mode handling.
+        """
         with self._gen_lock:
             # Drain any leftover events from prior runs
             while not self._token_queue.empty():
@@ -443,22 +472,14 @@ class RKLLMRuntime:
 
             inp = RKLLMInput()
             ctypes.memset(ctypes.byref(inp), 0, ctypes.sizeof(inp))
-            # v1.2.3 restructured RKLLMInput. We use "user" role for the
-            # full ChatML envelope (since rkllm_set_chat_template was
-            # called with empty wrappers during init_model, the runtime
-            # passes our prompt through verbatim).
-            inp.role = b"user"
-            # We handle `<think>\n` prefix injection ourselves in
-            # _build_chat_prompt — keep this False to avoid double-think.
-            inp.enable_thinking = False
+            inp.role = role.encode("utf-8")
+            inp.enable_thinking = enable_thinking
             inp.input_type = RKLLM_INPUT_PROMPT
             inp.input_data.prompt_input = prompt.encode("utf-8")
             infer = RKLLMInferParam()
             ctypes.memset(ctypes.byref(infer), 0, ctypes.sizeof(infer))
             infer.mode = RKLLM_INFER_GENERATE
-            # We manage multi-turn history ourselves (rebuild full prompt
-            # per turn) → tell the runtime to discard its own KV history.
-            infer.keep_history = 0
+            infer.keep_history = keep_history
 
             # rkllm_run blocks (is_async=False). The callback fires inline
             # for each token. When the model finishes, the callback is
@@ -1071,27 +1092,54 @@ class RKLLMBackend:
         last_summary_payload: Optional[dict] = None
         original_user_prompt = prompt
 
+        # Per-turn role-based content for v1.2.3.
+        # Turn 0: role="user", content = SYSTEM_PROMPT_TEMPLATE concatenated
+        # with the user's actual prompt. v1.2.3's RKLLMInput role enum
+        # doesn't document a "system" role, and rkllm_set_chat_template
+        # would disable thinking-mode handling, so we inline the system
+        # rules into the first user message. The model was trained with
+        # the full system prompt visible in every example, so it still
+        # recognises the rules even via this less-structured channel.
+        # Turn 1+: role="tool" with the JSON tool response. The runtime
+        # appends to the existing KV cache via keep_history=1.
+        first_turn_content = (
+            f"{system_prompt}\n\n"
+            f"User request: {prompt}"
+        )
+        next_role: str = "user"
+        next_content: str = first_turn_content
+        next_keep_history: int = 0   # 0 on first turn; 1 thereafter
+
         for turn in range(MAX_TURNS):
-            # Last-chance: at MAX_TURNS-1 without a verdict, inject the
-            # force-verdict directive so the model knows this is its
-            # final shot to finalize.
+            # Last-chance: at MAX_TURNS-1 without a verdict, send the
+            # force-verdict directive as the next user message instead
+            # of whatever was queued. The runtime sees this fresh user
+            # message + the in-KV-cache history.
             if (
                 not emitted_verdict
                 and not force_verdict_attempted
                 and turn == MAX_TURNS - 1
             ):
-                history.append({"role": "user", "content": FORCE_VERDICT_DIRECTIVE})
+                next_role = "user"
+                next_content = FORCE_VERDICT_DIRECTIVE
+                next_keep_history = 1  # keep prior KV
                 force_verdict_attempted = True
 
-            full_prompt = _build_chat_prompt(
-                system_prompt, history, enable_thinking=self._enable_thinking,
-            )
-
             try:
+                # rkllm v1.2.3: runtime applies built-in Qwen 3 chat
+                # template + handles <|im_end|> stop token. The role
+                # routes the message to the right slot in the template.
                 output = await loop.run_in_executor(
                     None,
-                    lambda: self._runtime.generate(full_prompt,
-                                                    timeout_s=PER_TURN_TIMEOUT_S),
+                    lambda r=next_role, c=next_content, kh=next_keep_history: (
+                        self._runtime.generate(
+                            c,
+                            role=r,
+                            enable_thinking=self._enable_thinking,
+                            keep_history=kh,
+                            timeout_s=PER_TURN_TIMEOUT_S,
+                        )
+                    ),
                 )
             except RKLLMLoadError as e:
                 yield {
@@ -1110,23 +1158,27 @@ class RKLLMBackend:
                 }
                 return
 
+            # After this point, any further generate() calls should keep
+            # the existing KV cache. (Reset only happens on a fresh
+            # run_troubleshoot call.)
+            next_keep_history = 1
+
             # Qwen 3 thinking mode: the raw output starts INSIDE a <think>
-            # block (because we prepended `<think>\n` to the prefix). The
+            # block (the runtime's built-in template prepends `<think>\n`
+            # to the assistant turn when enable_thinking=True). The
             # structured response (tool calls, verdict, recommendations)
-            # only exists AFTER `</think>`. Pre-strip so:
-            #   - parsers can't be tripped by stray XML mentions inside
-            #     the model's reasoning prose ("I should call <tool_call>")
-            #   - history stores the bounded post-think form (Qwen 3 model-
-            #     card guidance: "historical output should not include the
-            #     thinking")
-            # For the SSE thought event we keep the FULL raw output so the
-            # user sees live reasoning — frontend can default-collapse.
+            # only exists AFTER `</think>`. Pre-strip so the parsers
+            # can't be tripped by stray XML mentions inside the model's
+            # reasoning prose ("I should call <tool_call>").
             output_for_parsing = (
                 _strip_think(output) if self._enable_thinking else output
             )
 
-            # Track this turn's assistant output in conversation history.
-            # KV cache only sees the stripped form on subsequent turns.
+            # NOTE: history list is no longer rebuilt-per-turn — v1.2.3
+            # maintains KV cache via keep_history=1 on subsequent
+            # generate() calls. We keep the local `history` append for
+            # parity with the legacy test surface (see existing tests
+            # asserting message-count) but it's now informational only.
             history.append({"role": "assistant", "content": output_for_parsing})
 
             # Surface the model's POST-THINK prose as a thought event.
@@ -1199,10 +1251,18 @@ class RKLLMBackend:
                     if ok and tc["tool"] == "diag/summary" and isinstance(result, dict):
                         last_summary_payload = result
 
-                # Add tool responses to history for the next turn
+                # Queue the tool responses as the NEXT generate() call's
+                # role="tool" content. The v1.2.3 runtime appends to the
+                # existing KV cache (keep_history=1 set above) so the
+                # model sees the prior assistant turn + this tool result.
+                # Multiple tool responses concatenated with newlines —
+                # the runtime templates the whole blob as one tool turn.
+                next_role = "tool"
+                next_content = "\n".join(tool_responses_for_context)
+                # next_keep_history already set to 1 after first turn.
                 history.append({
                     "role": "tool",
-                    "content": "\n".join(tool_responses_for_context),
+                    "content": next_content,
                 })
 
             # Emit verdict (once)
@@ -1249,11 +1309,15 @@ class RKLLMBackend:
 
             # Prose-only turn (no tool_calls + no verdict + no
             # recommendations): the model is stuck. If we haven't tried
-            # the force-verdict directive yet, inject it + give the
-            # model one more chance. Otherwise terminate with synthetic
+            # the force-verdict directive yet, send it as the next
+            # user message + give the model one more chance with the
+            # existing KV cache. Otherwise terminate with synthetic
             # verdict.
             if not tool_calls and not verdict and not recommendations:
                 if not force_verdict_attempted and turn < MAX_TURNS - 1:
+                    next_role = "user"
+                    next_content = FORCE_VERDICT_DIRECTIVE
+                    # keep_history=1 already set after first turn.
                     history.append({
                         "role": "user",
                         "content": FORCE_VERDICT_DIRECTIVE,

@@ -1284,15 +1284,15 @@ class RKLLMBackend:
                     if ok and tc["tool"] == "diag/summary" and isinstance(result, dict):
                         last_summary_payload = result
 
-                # Queue the tool responses as the NEXT generate() call's
-                # role="tool" content. The v1.2.3 runtime appends to the
-                # existing KV cache (keep_history=1 set above) so the
-                # model sees the prior assistant turn + this tool result.
-                # Multiple tool responses concatenated with newlines —
-                # the runtime templates the whole blob as one tool turn.
-                next_role = "tool"
+                # Queue the tool responses as the NEXT generate() call.
+                # Use role="user" (NOT "tool") because our session's
+                # set_chat_template configured user prefix/postfix only —
+                # using role="tool" returns -1 from the runtime. The
+                # <tool_response>{...}</tool_response> wrapping matches
+                # the training format so the model sees it as the tool
+                # turn semantically. KV cache preserved via keep_history=1.
+                next_role = "user"
                 next_content = "\n".join(tool_responses_for_context)
-                # next_keep_history already set to 1 after first turn.
                 history.append({
                     "role": "tool",
                     "content": next_content,

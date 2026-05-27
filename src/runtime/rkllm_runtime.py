@@ -1106,25 +1106,33 @@ class RKLLMBackend:
         original_user_prompt = prompt
 
         # Per-turn role-based content for v1.2.3.
-        # Turn 0: role="user", content = system rules + user prompt as a
-        # single user-role message (since v1.2.3 doesn't expose a
-        # "system" role on RKLLMInput and rkllm_set_chat_template caused
-        # garbled output in lab tests — the runtime's parsing of the
-        # full <|im_start|>system\n...<|im_end|>\n template seems
-        # fragile when the system content is long). Inlining the system
-        # rules as "Instructions:\n[rules]\n\nRequest:\n[user]" is the
-        # most reliable channel — the 174-example fine-tune included
-        # the SYSTEM_PROMPT_TEMPLATE in every training example, so the
-        # model recognises these rules through training even when they
-        # arrive as user content.
-        # Turn 1+: role="tool" with the JSON tool response. The runtime
-        # appends to the existing KV cache via keep_history=1.
-        first_turn_content = (
-            f"Instructions:\n{system_prompt}\n\n"
-            f"Request: {prompt}"
-        )
+        #
+        # Inject system prompt via rkllm_set_chat_template with the
+        # canonical Qwen 3 markers (no <think>\n added — that broke
+        # generation in the lab on commit 609debc). The runtime wraps
+        # our system in <|im_start|>system\n...<|im_end|>\n, each user
+        # turn in <|im_start|>user\n...<|im_end|>\n, and opens
+        # assistant via <|im_start|>assistant\n. <|im_end|> stays as
+        # the per-turn stop token via the runtime's built-in handling.
+        try:
+            self._runtime._lib.rkllm_set_chat_template.restype = ctypes.c_int
+            self._runtime._lib.rkllm_set_chat_template.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+            ]
+            # Hold byte buffers in locals (ctypes c_char_p doesn't own).
+            sys_bytes = (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            ).encode("utf-8")
+            prefix_bytes = b"<|im_start|>user\n"
+            postfix_bytes = b"<|im_end|>\n<|im_start|>assistant\n"
+            self._runtime._lib.rkllm_set_chat_template(
+                self._runtime._handle, sys_bytes, prefix_bytes, postfix_bytes,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("rkllm_set_chat_template failed: %s", e)
+
         next_role: str = "user"
-        next_content: str = first_turn_content
+        next_content: str = prompt
         next_keep_history: int = 0   # 0 on first turn; 1 thereafter
 
         for turn in range(MAX_TURNS):

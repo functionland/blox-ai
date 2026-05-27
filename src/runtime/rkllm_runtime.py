@@ -470,12 +470,21 @@ class RKLLMRuntime:
                 except queue.Empty:
                     break
 
+            # CRITICAL: ctypes c_char_p does NOT own the bytes — if the
+            # Python bytes object is garbage-collected before the C call
+            # finishes reading it, the C side sees uninitialized memory.
+            # This caused the lab-observed gibberish-output bug 2026-05-27
+            # (model emitted "用户" + random text fragments). The
+            # encoded bytes objects MUST be held in named Python locals
+            # for the duration of the rkllm_run call.
+            role_bytes = role.encode("utf-8")
+            prompt_bytes = prompt.encode("utf-8")
             inp = RKLLMInput()
             ctypes.memset(ctypes.byref(inp), 0, ctypes.sizeof(inp))
-            inp.role = role.encode("utf-8")
+            inp.role = role_bytes
             inp.enable_thinking = enable_thinking
             inp.input_type = RKLLM_INPUT_PROMPT
-            inp.input_data.prompt_input = prompt.encode("utf-8")
+            inp.input_data.prompt_input = prompt_bytes
             infer = RKLLMInferParam()
             ctypes.memset(ctypes.byref(infer), 0, ctypes.sizeof(infer))
             infer.mode = RKLLM_INFER_GENERATE

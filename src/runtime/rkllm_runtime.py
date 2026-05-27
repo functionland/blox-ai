@@ -343,7 +343,15 @@ class RKLLMRuntime:
 
     def init_model(
         self,
-        max_context_len: int = 8192,
+        # 4096 matches the limit baked into the converted .rkllm by the
+        # rkllm-toolkit's default conversion (we didn't pass a custom
+        # max_context_len at build time). Asking for more here causes
+        # the runtime to reject init with
+        #   "max_context[N] must be less than the model's
+        #    max_context_limit[4096]"
+        # If a future conversion bumps the model's limit, raise this
+        # value in lock-step.
+        max_context_len: int = 4096,
         # max_new_tokens raised to 3072 with the Qwen 3 1.7B + thinking-
         # mode swap (advisor catch). Thinking blocks empirically run
         # 500-1500 tokens; the structured response adds another 200-500.

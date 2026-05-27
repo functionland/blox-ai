@@ -352,13 +352,17 @@ class RKLLMRuntime:
         # If a future conversion bumps the model's limit, raise this
         # value in lock-step.
         max_context_len: int = 4096,
-        # max_new_tokens raised to 3072 with the Qwen 3 1.7B + thinking-
-        # mode swap (advisor catch). Thinking blocks empirically run
-        # 500-1500 tokens; the structured response adds another 200-500.
-        # The prior 2048 was tight enough to truncate mid-verdict on
-        # hard prompts, which manifests as no </think> in the output
-        # → strip_think returns empty → user sees nothing useful.
-        max_new_tokens: int = 3072,
+        # max_new_tokens lowered to 768 (2026-05-27 lab test). On RK3588
+        # NPU, Qwen 3 1.7B in thinking mode generates ~5-7 tokens/sec.
+        # 3072 would cap a turn at ~7-10 minutes which exceeds phone-
+        # app UX timeouts (and even our per-token 90s wait stretches
+        # the user's perception). 768 caps at ~2-3 minutes — long but
+        # bounded. The model occasionally truncates verbose verdicts
+        # at this limit, which the synthetic-verdict fallback handles
+        # gracefully. Raise back once we have a faster model or a real
+        # streaming SSE path that emits tokens as they arrive (current
+        # generate() blocks until the full turn completes).
+        max_new_tokens: int = 768,
         temperature: float = 0.6,
         top_k: int = 20,
         top_p: float = 0.8,

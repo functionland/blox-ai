@@ -13,10 +13,24 @@ Three layers:
   - try_load(): factory; returns None on any failure so app.py's
     lifespan falls back to MockBackend cleanly.
 
-The chat template + tool-call grammar is Qwen 2.5's native
-function-calling format. Qwen emits tool calls wrapped in
-<tool_call>{"name":"...","arguments":{...}}</tool_call>; we append
-results back as <tool_response>{...}</tool_response>. The runbook +
+Chat template: Qwen 2.5 + Qwen 3 share the same ChatML envelope
+(<|im_start|>{role}\\n{content}<|im_end|>). Qwen 3 adds hybrid
+thinking mode — the assistant turn is prefixed with `<think>\\n`,
+the model emits chain-of-thought, then `</think>`, then the
+structured answer. We detect Qwen 3 from the model filename and:
+  1. Inject the `<think>\\n` prefix into the assistant turn so the
+     model always reasons before answering (highest-intelligence mode).
+  2. Strip the `<think>...</think>` content from history BEFORE the
+     next turn — keeps KV cache bounded as the tool-call loop runs.
+     This matches the Qwen 3 model-card guidance: "historical model
+     output should only include the final output, not the thinking".
+  3. Keep the think content in the SSE `thought` event so the user
+     sees the model's reasoning live (frontend can collapse the
+     bubble if it gets verbose).
+
+Tool-call grammar (Qwen-family-agnostic): tool calls wrapped in
+<tool_call>{"name":"...","arguments":{...}}</tool_call>; results
+appended back as <tool_response>{...}</tool_response>. Runbook +
 tool definitions come in via system prompt at session start.
 """
 from __future__ import annotations
@@ -44,7 +58,7 @@ logger = logging.getLogger("blox-ai.rkllm")
 DEFAULT_SO_PATH = "/lib/librkllmrt.so"
 DEFAULT_FALLBACK_SO_PATH = "/app/vendor/rkllm/librkllmrt.so"
 DEFAULT_MODEL_DIR = "/uniondrive/blox-ai/model"
-DEFAULT_MODEL_FILENAME = "qwen2.5-3b-instruct-rk3588-w8a8.rkllm"
+DEFAULT_MODEL_FILENAME = "qwen3-1.7b-rk3588-w8a8.rkllm"
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +286,13 @@ class RKLLMRuntime:
     def init_model(
         self,
         max_context_len: int = 8192,
-        max_new_tokens: int = 2048,
+        # max_new_tokens raised to 3072 with the Qwen 3 1.7B + thinking-
+        # mode swap (advisor catch). Thinking blocks empirically run
+        # 500-1500 tokens; the structured response adds another 200-500.
+        # The prior 2048 was tight enough to truncate mid-verdict on
+        # hard prompts, which manifests as no </think> in the output
+        # → strip_think returns empty → user sees nothing useful.
+        max_new_tokens: int = 3072,
         temperature: float = 0.6,
         top_k: int = 20,
         top_p: float = 0.8,
@@ -500,18 +520,99 @@ def _build_system_prompt(runbook_text: str = "", max_runbook_chars: int = 2000) 
     return SYSTEM_PROMPT_TEMPLATE.format(tool_list=tool_list, runbook_excerpt=excerpt)
 
 
-# Qwen 2.5 chat template tokens
+# Qwen 2.5 + Qwen 3 chat template tokens (identical ChatML envelope)
 _QWEN_IM_START = "<|im_start|>"
 _QWEN_IM_END = "<|im_end|>"
 
+# Qwen 3 hybrid-thinking sentinel — literal text the model emits when
+# thinking mode is on. Per Qwen 3 model card / tokenizer_config.json,
+# `<think>` / `</think>` are NOT special tokens; they pass through
+# verbatim even with skip_special_token=True. Verified at first lab
+# inference (log the raw generate() output once on the new .rkllm to
+# confirm — see comment on RKLLMBackend._strip_think_for_history).
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
-def _build_chat_prompt(system: str, history: list[dict]) -> str:
-    """Format using Qwen 2.5's ChatML template. history is a list of
-    {role: user|assistant|tool, content: str} dicts."""
+
+def _is_qwen3_model(model_path: Optional[str]) -> bool:
+    """Detect Qwen 3 model from filename. Matches `qwen3` or `qwen-3`
+    case-insensitive. Used to gate the thinking-mode wiring so devices
+    that haven't yet downloaded the Qwen 3 file (and still have an old
+    Qwen 2.5 cached) continue using the legacy non-thinking format.
+
+    Filename-based rather than tokenizer-introspecting because RKLLM-
+    quantized models don't expose tokenizer config the way HF models
+    do — the .rkllm file is opaque tensors. Filename is the only signal
+    we have at backend-construction time."""
+    if not model_path:
+        return False
+    name = os.path.basename(model_path).lower()
+    return "qwen3" in name or "qwen-3" in name
+
+
+def _strip_think(text: str) -> str:
+    """Drop Qwen 3 <think>...</think> reasoning from `text`.
+
+    Caller MUST only invoke when thinking mode is on (output produced
+    with the `<think>\\n` assistant prefix). The contract: the output
+    starts INSIDE a think block (because the prefix already opened
+    one), continues with chain-of-thought prose, hits `</think>`, then
+    contains the structured answer. We return everything after the
+    first `</think>`.
+
+    Edge cases:
+      - TRUNCATED (no `</think>` anywhere): the model hit
+        max_new_tokens mid-thought. The whole output is internal
+        reasoning with no usable structured content — return empty.
+        Caller treats this as a prose-only / no-verdict turn and
+        force-verdicts.
+      - SELF-WRAPPED (model emits its own `<think>...</think>` pair
+        AFTER the prefix closure, e.g. it changes mind mid-answer):
+        defensively sub out any further pairs in the tail.
+      - TRAILING-OPEN (model started a new `<think>` near the end and
+        ran out of tokens): drop from the orphan open tag to end of
+        string so it doesn't bleed into history.
+
+    advisor-flagged: an earlier `rfind` variant would have dropped
+    content between multiple closing tags. split("</think>", 1) does
+    the right thing in a single pass."""
+    if _THINK_CLOSE not in text:
+        return ""
+    text = text.split(_THINK_CLOSE, 1)[1]
+    text = _THINK_RE.sub("", text)
+    open_idx = text.find(_THINK_OPEN)
+    if open_idx != -1:
+        text = text[:open_idx]
+    return text
+
+
+def _build_chat_prompt(
+    system: str,
+    history: list[dict],
+    enable_thinking: bool = False,
+) -> str:
+    """Format using Qwen 2.5 / Qwen 3 ChatML template. history is a
+    list of {role: user|assistant|tool, content: str} dicts.
+
+    enable_thinking=True (Qwen 3 path): inject the `<think>\\n` prefix
+    into the assistant turn so the model starts inside the think block.
+    Matches `apply_chat_template(enable_thinking=True)` from the
+    Hugging Face tokenizer config — required for highest-intelligence
+    mode on Qwen 3."""
     parts = [f"{_QWEN_IM_START}system\n{system}{_QWEN_IM_END}"]
     for msg in history:
         parts.append(f"{_QWEN_IM_START}{msg['role']}\n{msg['content']}{_QWEN_IM_END}")
-    parts.append(f"{_QWEN_IM_START}assistant\n")
+    assistant_prefix = f"{_QWEN_IM_START}assistant\n"
+    if enable_thinking:
+        # Tokenizer template emits exactly `<think>\n` (with trailing
+        # newline) immediately after the role marker's newline. Match
+        # that byte-for-byte. If this drifts from the HF template by a
+        # whitespace character the model is mildly confused but still
+        # functional — verify on lab by inspecting one full prompt
+        # before generate().
+        assistant_prefix += f"{_THINK_OPEN}\n"
+    parts.append(assistant_prefix)
     return "\n".join(parts)
 
 
@@ -754,13 +855,22 @@ ACTION_ID_FMT = "rk-{turn}-{idx}"
 
 @dataclass
 class RKLLMBackend:
-    """Production backend: real Qwen 2.5 3B + tool-call loop.
+    """Production backend: real Qwen 2.5 / Qwen 3 + tool-call loop.
 
     Construct via try_load() which injects the executor + signer hooks
     so the backend can run diag tools inline and mint real HMAC tokens
     for recommended_action events. The bridge in tool_call_loop.py
     detects `consumes_tool_results=True` and skips its own tool_call
-    interception (the backend handles it end-to-end)."""
+    interception (the backend handles it end-to-end).
+
+    Qwen 3 thinking mode is wired automatically based on the model's
+    filename (see _is_qwen3_model). When ON:
+      - assistant prefix gets `<think>\\n` injected (model thinks first)
+      - SSE thought event receives the raw output WITH think content
+        (UI transparency — frontend can collapse the bubble)
+      - history entries strip <think>...</think> before next turn
+        (KV cache stays bounded across the tool-call loop)
+    """
 
     name: str = "rkllm"
     loaded: bool = False
@@ -770,6 +880,9 @@ class RKLLMBackend:
     _tool_executor: Optional[Callable[[str, dict], Awaitable[dict]]] = None
     _action_signer: Optional[Callable[[str], str]] = None
     _runbook_loader: Optional[Any] = None
+    # Set by try_load() from the resolved model_path. Controls assistant-
+    # prefix injection + per-turn history rewriting.
+    _enable_thinking: bool = False
 
     # Tells the bridge: don't intercept tool_call events; we handle them.
     consumes_tool_results: bool = True
@@ -851,7 +964,9 @@ class RKLLMBackend:
                 history.append({"role": "user", "content": FORCE_VERDICT_DIRECTIVE})
                 force_verdict_attempted = True
 
-            full_prompt = _build_chat_prompt(system_prompt, history)
+            full_prompt = _build_chat_prompt(
+                system_prompt, history, enable_thinking=self._enable_thinking,
+            )
 
             try:
                 output = await loop.run_in_executor(
@@ -876,19 +991,46 @@ class RKLLMBackend:
                 }
                 return
 
-            # Track this turn's assistant output in conversation history.
-            history.append({"role": "assistant", "content": output})
+            # Qwen 3 thinking mode: the raw output starts INSIDE a <think>
+            # block (because we prepended `<think>\n` to the prefix). The
+            # structured response (tool calls, verdict, recommendations)
+            # only exists AFTER `</think>`. Pre-strip so:
+            #   - parsers can't be tripped by stray XML mentions inside
+            #     the model's reasoning prose ("I should call <tool_call>")
+            #   - history stores the bounded post-think form (Qwen 3 model-
+            #     card guidance: "historical output should not include the
+            #     thinking")
+            # For the SSE thought event we keep the FULL raw output so the
+            # user sees live reasoning — frontend can default-collapse.
+            output_for_parsing = (
+                _strip_think(output) if self._enable_thinking else output
+            )
 
-            # Surface the model's prose as a thought event
-            thought_text = strip_blocks(output)
+            # Track this turn's assistant output in conversation history.
+            # KV cache only sees the stripped form on subsequent turns.
+            history.append({"role": "assistant", "content": output_for_parsing})
+
+            # Surface the model's POST-THINK prose as a thought event.
+            # User preference (literal): hide <think> content from UI
+            # too, not just from KV. We feed strip_blocks the already-
+            # de-thinked text so chain-of-thought reasoning never reaches
+            # the SSE stream. If the post-think prose is empty (turn
+            # consisted only of structured blocks), emit a short synthetic
+            # marker so the stream isn't silent on slow BLE transports.
+            thought_text = strip_blocks(output_for_parsing)
             if thought_text:
                 # SSE thought schema: minLength 1, maxLength 4000
                 yield {"type": "thought", "payload": thought_text[:4000]}
+            elif self._enable_thinking:
+                # Qwen 3 turn was 100% structured output after <think>;
+                # avoid a silent stretch by emitting a tiny marker.
+                yield {"type": "thought", "payload": "Analyzing diagnostics..."}
 
-            # Parse blocks
-            verdict = parse_verdict(output)
-            recommendations = parse_recommendations(output)
-            tool_calls = parse_tool_calls(output)
+            # Parse blocks from the post-think text so XML mentions inside
+            # reasoning prose can't pollute the parse results.
+            verdict = parse_verdict(output_for_parsing)
+            recommendations = parse_recommendations(output_for_parsing)
+            tool_calls = parse_tool_calls(output_for_parsing)
 
             # Run each tool call inline + feed result back as tool_response
             if tool_calls and self._tool_executor is not None:
@@ -1043,6 +1185,19 @@ def try_load(model_path_override: Optional[str] = None) -> Optional[RKLLMBackend
     except (RKLLMLoadError, OSError) as e:
         logger.warning("RKLLM init failed: %s; MockBackend stays wired", e)
         return None
-    backend = RKLLMBackend(loaded=True, _runtime=runtime)
-    logger.info("RKLLMBackend loaded (so=%s, model=%s)", so_path, model_path)
+    # Qwen 3 thinking mode is filename-gated so devices that still have
+    # an old Qwen 2.5 cached (Qwen 3 download not yet completed) continue
+    # using the legacy non-thinking format. The download_model.sh cleanup
+    # logic removes the stale 1.5B AFTER the new Qwen 3 SHA verifies, so
+    # this detection flips on automatically once the new file lands.
+    enable_thinking = _is_qwen3_model(model_path)
+    backend = RKLLMBackend(
+        loaded=True,
+        _runtime=runtime,
+        _enable_thinking=enable_thinking,
+    )
+    logger.info(
+        "RKLLMBackend loaded (so=%s, model=%s, thinking=%s)",
+        so_path, model_path, enable_thinking,
+    )
     return backend

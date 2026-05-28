@@ -235,6 +235,13 @@ async def troubleshoot(req: TroubleshootRequest, request: Request) -> Response:
     session.generator_done = False
     session.consumer_generation += 1
     my_generation = session.consumer_generation
+    # Wake any consumer that was parked in cond.wait() for the prior
+    # generator — last-wins only works if the old loop actually wakes
+    # up to check the generation token. Without this notify, a
+    # consumer that's mid-pause (e.g. awaiting a user_question reply)
+    # sleeps forever after a new consumer arrives. advisor 2026-05-28.
+    async with session.cond:
+        session.cond.notify_all()
 
     session.generator_task = asyncio.create_task(
         _drive_generator_into_buffer(
@@ -244,9 +251,10 @@ async def troubleshoot(req: TroubleshootRequest, request: Request) -> Response:
     )
 
     async def sse_stream():
-        # consumer_generation was bumped above; capture it for the
-        # last-wins check in _stream_from_buffer.
-        session.consumer_generation = my_generation
+        # `my_generation` was captured immediately after the increment
+        # above; _stream_from_buffer re-reads `session.consumer_generation`
+        # internally so we don't echo the bump here (the duplicate write
+        # would clobber a newer consumer's increment, advisor 2026-05-28).
         try:
             async for chunk in _stream_from_buffer(session, from_seq=0):
                 yield chunk
@@ -294,7 +302,12 @@ async def troubleshoot_resume(
     # Slide TTL — resume IS user activity.
     session_mgr.touch(session.session_id)
     # Last-wins: bump generation so any prior consumer's loop exits.
+    # Also wake any parked old consumer so it wakes up + checks the
+    # generation token + exits cleanly (advisor 2026-05-28: old
+    # consumer mid-pause would otherwise sleep forever).
     session.consumer_generation += 1
+    async with session.cond:
+        session.cond.notify_all()
 
     async def sse_stream():
         try:

@@ -137,52 +137,59 @@ def peer_id_to_bytes32(peer_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _keccak256(data: bytes) -> bytes:
-    """keccak256 — needed for Ethereum function selectors. hashlib has
-    sha3_256 (NIST SHA-3) which is DIFFERENT from keccak256 (the
-    pre-standardization variant Ethereum uses). On Python 3.6+ we get
-    keccak via `Cryptodome.Hash.keccak` OR `eth_utils`. Both are heavy.
-    pysha3 was the standard but is unmaintained.
-
-    Workaround: most function selectors are SHORT + KNOWN. Precompute
-    them at module load so we never need keccak at runtime. This dict
-    is the entire selector surface for our two contracts' view methods
-    we use.
-    """
-    raise NotImplementedError(
-        "keccak256 not implemented; use precomputed FUNCTION_SELECTORS"
-    )
-
-
-# Precomputed Ethereum 4-byte function selectors for the view methods
-# we call. Each selector is the first 4 bytes of keccak256(signature).
-# Generated offline via `cast sig "<signature>"` (foundry) and pinned
-# here so we have ZERO runtime keccak dependency. When adding a new
-# method: compute via `cast sig` + paste below.
+# Precomputed Ethereum 4-byte function selectors for the view methods we
+# call. Each selector is the first 4 bytes of keccak256(signature).
+# Computed OFFLINE so we have zero runtime keccak dependency. Reproduction:
 #
-# Signatures match the canonical ABI types — peerId is bytes32, poolId
-# is uint32 (per Fula contract source).
+#   from Crypto.Hash import keccak
+#   k = keccak.new(digest_bits=256); k.update(b'<signature>')
+#   print('0x' + k.hexdigest()[:8])
+#
+# Sanity check: 'transfer(address,uint256)' must yield 0xa9059cbb (the
+# canonical ERC20 transfer selector). Verified 2026-05-28.
+#
+# Signatures verified against:
+#   PoolStorage:  E:/GitHub/fula-chain/contracts/core/StoragePool.sol:478,531
+#   RewardEngine: E:/GitHub/mainnet-claim-web/abi.js lines 2104, 2451 (the
+#                 JS ABI is extracted from contracts/RewardEngine.json)
+#
+# CRITICAL — param orders differ across methods, do not assume:
+#   isPeerIdMemberOfPool(uint32 poolId, bytes32 peerId)
+#   isPeerOnlineAtTimestamp(uint32 poolId, uint256 timestamp, bytes32 peerId)
+#   getOnlineStatusSince(bytes32 peerId, uint32 poolId, uint256 sinceTime)
+#                       ^^^^^^^ peerId is FIRST in this one
 FUNCTION_SELECTORS: dict[str, str] = {
     # PoolStorage view methods
-    "isMemberOfPool(uint32,bytes32)": "0x00000000",  # PLACEHOLDER
-    "members(uint32,bytes32)":        "0x00000000",  # PLACEHOLDER
+    # → returns (bool isMember, address memberAddress) — decode 1st word only
+    "isPeerIdMemberOfPool(uint32,bytes32)":             "0xb098a605",
+    # → returns (address member, uint256 lockedTokens) — useful for diag detail
+    "getPeerIdInfo(uint32,bytes32)":                    "0x16f4c1d9",
     # RewardEngine view methods
-    "isOnline(uint32,bytes32)":       "0x00000000",  # PLACEHOLDER
-    "isPeerOnline(uint32,bytes32)":   "0x00000000",  # PLACEHOLDER
+    # → returns bool isOnline (single bool, 32-byte padded)
+    "isPeerOnlineAtTimestamp(uint32,uint256,bytes32)":  "0x6ce7c477",
+    # → returns (uint256 onlineCount, uint256 totalExpected) — better recency
+    #   signal than the point-in-time check: did the peer report online at
+    #   ANY of the expected periods since `sinceTime`?
+    "getOnlineStatusSince(bytes32,uint32,uint256)":     "0x428373d6",
 }
-# IMPORTANT: the selectors above are PLACEHOLDERS. Phase 0.5b must:
-#   1. Read RewardEngine.json + PoolStorage ABI from mainnet-claim-web
-#      to confirm the EXACT function names + signatures we should call
-#   2. Compute selectors offline via `cast sig`
-#   3. Paste real values here BEFORE the diag tool ships
-# The function above is structured so finishing this step is a one-line
-# change per selector with no algorithm risk.
 
 
 def encode_uint32(value: int) -> bytes:
     """ABI-encode a uint32 as 32 bytes (left-padded)."""
     if not isinstance(value, int) or value < 0 or value > 0xFFFFFFFF:
         raise ValueError(f"uint32 out of range: {value}")
+    return value.to_bytes(32, byteorder="big")
+
+
+# uint256 max — used for range checks. Solidity's uint256 is 2^256 - 1.
+_UINT256_MAX = (1 << 256) - 1
+
+
+def encode_uint256(value: int) -> bytes:
+    """ABI-encode a uint256 as 32 bytes (left-padded). Used for unix
+    timestamps and other large unsigned values."""
+    if not isinstance(value, int) or value < 0 or value > _UINT256_MAX:
+        raise ValueError(f"uint256 out of range: {value}")
     return value.to_bytes(32, byteorder="big")
 
 

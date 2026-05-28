@@ -1,24 +1,32 @@
 """Unit tests for src/tools/chain.py — bytes32(peerId) + ABI encoding +
-eth_call wrapper + tristate cache.
+eth_call wrapper + tristate cache + function selectors.
 
 bytes32 conversion is fixture-tested against the lab device's actual
 ipfs_cluster peerId (12D3KooWE6gC...At3WedRaZ) to lock the algorithm
-against accidental regressions. Function selectors are NOT tested
-because they're pending ABI inspection (placeholder values).
+against accidental regressions.
+
+Function selectors are pinned against their canonical signatures so any
+future edit that breaks a signature (typo, type mismatch, param-order
+flip) gets caught at test time. ERC20 transfer is included as the
+universal keccak256 sanity check.
 """
 from __future__ import annotations
 
 import pytest
 
+from Crypto.Hash import keccak
+
 from src.tools.chain import (
     CallResult,
     DEFAULT_RPC_URLS,
+    FUNCTION_SELECTORS,
     _b58_decode,
     clear_cache_for_tests,
     decode_bool,
     encode_bytes32,
     encode_call,
     encode_uint32,
+    encode_uint256,
     eth_call,
     peer_id_to_bytes32,
 )
@@ -147,6 +155,71 @@ class TestAbiEncoding:
     def test_encode_call_rejects_bad_selector_length(self):
         with pytest.raises(ValueError):
             encode_call("0x1234", encode_uint32(0))
+
+    def test_encode_uint256_pads_left_to_32_bytes(self):
+        encoded = encode_uint256(12345)
+        assert len(encoded) == 32
+        assert encoded[-2:] == (12345).to_bytes(2, "big")
+        assert encoded[:30] == b"\x00" * 30
+
+    def test_encode_uint256_max_value(self):
+        max_v = (1 << 256) - 1
+        encoded = encode_uint256(max_v)
+        assert len(encoded) == 32
+        assert encoded == b"\xff" * 32
+
+    def test_encode_uint256_rejects_negative(self):
+        with pytest.raises(ValueError):
+            encode_uint256(-1)
+
+    def test_encode_uint256_rejects_overflow(self):
+        with pytest.raises(ValueError):
+            encode_uint256(1 << 256)
+
+
+# ---------------------------------------------------------------------------
+# Function selectors — pinned against canonical signatures so any future
+# typo/type-mismatch/param-order edit breaks the test.
+# ---------------------------------------------------------------------------
+
+
+def _compute_selector(signature: str) -> str:
+    """Recompute first 4 bytes of keccak256(signature) for verification."""
+    k = keccak.new(digest_bits=256)
+    k.update(signature.encode("utf-8"))
+    return "0x" + k.hexdigest()[:8]
+
+
+class TestFunctionSelectors:
+    def test_keccak_implementation_works(self):
+        """Self-check: the canonical ERC20 transfer selector is 0xa9059cbb.
+        If this fails, the pycryptodome keccak in the test env is broken
+        and every selector test below is meaningless."""
+        assert _compute_selector("transfer(address,uint256)") == "0xa9059cbb"
+
+    @pytest.mark.parametrize("signature", list(FUNCTION_SELECTORS.keys()))
+    def test_pinned_selector_matches_computed_value(self, signature: str):
+        """Each pinned selector must equal keccak256(signature)[:4]. A
+        signature typo (wrong type, wrong param order) shows up here."""
+        assert FUNCTION_SELECTORS[signature] == _compute_selector(signature)
+
+    def test_no_placeholder_selectors_remain(self):
+        """No 0x00000000 placeholders. Catches the case where someone
+        adds a new entry but forgets to compute the selector."""
+        for sig, sel in FUNCTION_SELECTORS.items():
+            assert sel != "0x00000000", f"placeholder still in {sig}"
+
+    def test_required_view_methods_present(self):
+        """The four view methods diag/identity_health (Phase 0.5b) will
+        depend on must remain in the dict. If a future edit removes one,
+        the diag tool breaks silently — this test catches it."""
+        required = {
+            "isPeerIdMemberOfPool(uint32,bytes32)",
+            "getPeerIdInfo(uint32,bytes32)",
+            "isPeerOnlineAtTimestamp(uint32,uint256,bytes32)",
+            "getOnlineStatusSince(bytes32,uint32,uint256)",
+        }
+        assert required.issubset(FUNCTION_SELECTORS.keys())
 
 
 # ---------------------------------------------------------------------------

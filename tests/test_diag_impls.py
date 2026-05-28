@@ -1238,21 +1238,32 @@ _FAKE_FULA_GO_LOG = """\
 """
 
 
+def _make_fake_fula_go_client(state="running", restart_count=0,
+                               started_at="2026-05-28T06:21:20.874173806Z",
+                               log_bytes=None):
+    """Build a fake docker SDK client that returns a fake `fula_go`
+    container with the given attrs + logs."""
+    from unittest.mock import MagicMock
+    fake_container = MagicMock()
+    fake_container.attrs = {
+        "State": {"Status": state, "StartedAt": started_at},
+        "RestartCount": restart_count,
+    }
+    fake_container.logs = MagicMock(return_value=log_bytes or b"")
+    fake_client = MagicMock()
+    fake_client.containers.get = MagicMock(return_value=fake_container)
+    return fake_client
+
+
 def test_fula_go_health_running_with_recent_mdns_and_pool_event():
-    """Note the (stdout, stderr) split — `docker logs` writes container
-    output to stderr by default. Lab 2026-05-28 caught the regression
-    where the impl was reading stdout only."""
+    """Note container.logs() returns BYTES with both stdout AND stderr
+    merged (the SDK's default). fula_go's zap writes to stderr — the
+    SDK handles the merge for us; no manual concat needed."""
     from src.tools.diag_impls import fula_go_health as mod
-
-    def fake_run(cmd, timeout_s=5.0):
-        if cmd[0] == "docker" and cmd[1] == "inspect":
-            return 0, "running|0|2026-05-28T06:21:20.874173806Z\n", ""
-        if cmd[0] == "docker" and cmd[1] == "logs":
-            # Container logs land on STDERR per docker convention.
-            return 0, "", _FAKE_FULA_GO_LOG
-        return -1, "", ""
-
-    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+    fake_client = _make_fake_fula_go_client(
+        log_bytes=_FAKE_FULA_GO_LOG.encode("utf-8"),
+    )
+    with patch.object(mod, "_docker_client", return_value=fake_client):
         r = mod.diag_fula_go_health()
     assert r["container_running"] is True
     assert r["container_state"] == "running"
@@ -1270,26 +1281,36 @@ def test_fula_go_health_running_with_recent_mdns_and_pool_event():
 
 def test_fula_go_health_container_not_running_short_circuits():
     from src.tools.diag_impls import fula_go_health as mod
-
-    def fake_run(cmd, timeout_s=5.0):
-        if cmd[0] == "docker" and cmd[1] == "inspect":
-            return 0, "exited|3|2026-05-28T06:00:00Z\n", ""
-        # Should NOT be called when container_running=False
-        return -1, "", ""
-
-    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+    fake_client = _make_fake_fula_go_client(state="exited", restart_count=3,
+                                             started_at="2026-05-28T06:00:00Z")
+    with patch.object(mod, "_docker_client", return_value=fake_client):
         r = mod.diag_fula_go_health()
     assert r["container_running"] is False
     assert r["container_state"] == "exited"
     assert r["restart_count"] == 3
     assert "last_mdns_loaded_ts" not in r
+    # logs() should NOT be called when not running
+    fake_client.containers.get.return_value.logs.assert_not_called()
     _validate(r, "fula_go_health")
 
 
-def test_fula_go_health_inspect_unavailable():
+def test_fula_go_health_docker_unavailable():
+    """Docker SDK unable to connect — container_running=false, no
+    further fields."""
     from src.tools.diag_impls import fula_go_health as mod
-    with patch.object(mod, "run_subprocess",
-                      return_value=(-1, "", "command not found")):
+    with patch.object(mod, "_docker_client", return_value=None):
+        r = mod.diag_fula_go_health()
+    assert r["container_running"] is False
+    _validate(r, "fula_go_health")
+
+
+def test_fula_go_health_container_not_found():
+    """fula_go doesn't exist in docker — get() raises NotFound."""
+    from src.tools.diag_impls import fula_go_health as mod
+    from unittest.mock import MagicMock
+    fake_client = MagicMock()
+    fake_client.containers.get.side_effect = Exception("404 not found")
+    with patch.object(mod, "_docker_client", return_value=fake_client):
         r = mod.diag_fula_go_health()
     assert r["container_running"] is False
     _validate(r, "fula_go_health")
@@ -1310,26 +1331,39 @@ CURRENT_USER=pi
 """
 
 
+def _make_fake_docker_for_images(images_by_container):
+    """Build a docker SDK fake that returns fake containers with
+    Config.Image attrs from the given map."""
+    from unittest.mock import MagicMock
+
+    def get_container(name):
+        if name not in images_by_container:
+            raise Exception(f"No such container: {name}")
+        c = MagicMock()
+        c.attrs = {"Config": {"Image": images_by_container[name]}}
+        return c
+
+    client = MagicMock()
+    client.containers.get.side_effect = get_container
+    return client
+
+
 def test_image_versions_all_match():
     from src.tools.diag_impls import image_versions as mod
-
-    def fake_run(cmd, timeout_s=3.0):
-        # docker inspect <c> --format {{.Config.Image}}
-        container = cmd[2]
-        return 0, {
-            "fula_go":        "functionland/go-fula:test153",
-            "fula_fxsupport": "functionland/fxsupport:test153",
-            "ipfs_cluster":   "functionland/ipfs-cluster:test153",
-            "fula_pinning":   "functionland/fula-pinning:test153",
-            "fula_gateway":   "functionland/fula-gateway:test153",
-            "ipfs_host":      "ipfs/kubo:release",
-        }.get(container, "") + "\n", ""
+    fake = _make_fake_docker_for_images({
+        "fula_go":        "functionland/go-fula:test153",
+        "fula_fxsupport": "functionland/fxsupport:test153",
+        "ipfs_cluster":   "functionland/ipfs-cluster:test153",
+        "fula_pinning":   "functionland/fula-pinning:test153",
+        "fula_gateway":   "functionland/fula-gateway:test153",
+        "ipfs_host":      "ipfs/kubo:release",
+    })
 
     def fake_open(path, *args, **kwargs):
         from io import StringIO
         return StringIO(_FAKE_ENV)
 
-    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+    with patch.object(mod, "_docker_client", return_value=fake), \
          patch("builtins.open", side_effect=fake_open):
         r = mod.diag_image_versions()
     assert r["mismatched_containers"] == []
@@ -1344,18 +1378,20 @@ def test_image_versions_all_match():
 
 def test_image_versions_mismatch_detected():
     from src.tools.diag_impls import image_versions as mod
-
-    def fake_run(cmd, timeout_s=3.0):
-        container = cmd[2]
-        if container == "fula_go":
-            return 0, "functionland/go-fula:release\n", ""   # DRIFTED
-        return 0, "functionland/x:test153\n", ""
+    fake = _make_fake_docker_for_images({
+        "fula_go":        "functionland/go-fula:release",   # DRIFTED
+        "fula_fxsupport": "functionland/x:test153",
+        "ipfs_cluster":   "functionland/x:test153",
+        "fula_pinning":   "functionland/x:test153",
+        "fula_gateway":   "functionland/x:test153",
+        "ipfs_host":      "ipfs/kubo:release",
+    })
 
     def fake_open(path, *args, **kwargs):
         from io import StringIO
         return StringIO(_FAKE_ENV)
 
-    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+    with patch.object(mod, "_docker_client", return_value=fake), \
          patch("builtins.open", side_effect=fake_open):
         r = mod.diag_image_versions()
     assert "fula_go" in r["mismatched_containers"]
@@ -1366,22 +1402,20 @@ def test_image_versions_mismatch_detected():
 
 def test_image_versions_env_missing_returns_unset_expected():
     from src.tools.diag_impls import image_versions as mod
-
-    def fake_run(cmd, timeout_s=3.0):
-        return 0, "functionland/go-fula:test153\n", ""
+    fake = _make_fake_docker_for_images({
+        "fula_go": "functionland/go-fula:test153",
+    })
 
     def fake_open(path, *args, **kwargs):
         raise FileNotFoundError(path)
 
-    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+    with patch.object(mod, "_docker_client", return_value=fake), \
          patch("builtins.open", side_effect=fake_open):
         r = mod.diag_image_versions()
     fula_go_entry = [c for c in r["containers"] if c["container"] == "fula_go"][0]
     assert fula_go_entry["expected_image"] == "unset"
     # With expected=unset, match defaults to False; mismatched_containers
     # only includes entries where BOTH actual and expected are present.
-    # So when .env is missing entirely, we surface the actual but don't
-    # flag drift.
     assert "fula_go" not in r["mismatched_containers"]
     _validate(r, "image_versions")
 

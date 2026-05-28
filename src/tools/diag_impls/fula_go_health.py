@@ -21,12 +21,20 @@ from __future__ import annotations
 import json
 import re
 
-from src.tools.diag_impls._helpers import run_subprocess
-
 
 CONTAINER = "fula_go"
 _LOG_TAIL_LINES = 500
-_TIMEOUT_S = 5.0
+
+
+# docker SDK is the deployed container's path to docker.sock. The docker
+# CLI is NOT installed in the blox-ai container image (would add ~50MB).
+# Importing lazily so tests can patch `docker.from_env` per-test.
+def _docker_client():
+    try:
+        import docker
+        return docker.from_env(timeout=5)
+    except Exception:
+        return None
 
 # Keywords that mark a pool-relevant event in fula_go logs. We're
 # conservative — better to surface a few false-positives (e.g., a
@@ -43,42 +51,44 @@ _MDNS_LOADED_RE = re.compile(r"mdns info loaded from config file", re.IGNORECASE
 def diag_fula_go_health() -> dict:
     out: dict = {"container_running": False}
 
-    # 1. docker inspect — container state + uptime + restarts.
-    rc, inspect_out, _ = run_subprocess(
-        ["docker", "inspect", CONTAINER,
-         "--format",
-         "{{.State.Status}}|{{.RestartCount}}|{{.State.StartedAt}}"],
-        timeout_s=_TIMEOUT_S,
-    )
-    if rc == 0 and inspect_out:
-        parts = inspect_out.strip().split("|", 2)
-        if len(parts) == 3:
-            state, restart_str, started = parts
-            out["container_state"] = state
-            out["container_running"] = state == "running"
-            try:
-                out["restart_count"] = int(restart_str)
-            except ValueError:
-                pass
-            if started and started != "0001-01-01T00:00:00Z":
-                out["container_started_at"] = started
+    client = _docker_client()
+    if client is None:
+        return out
+
+    # 1. inspect — container state + uptime + restarts.
+    try:
+        container = client.containers.get(CONTAINER)
+    except Exception:
+        # Container doesn't exist, docker.sock unreachable, etc.
+        return out
+
+    attrs = container.attrs or {}
+    state_dict = attrs.get("State") or {}
+    state = state_dict.get("Status") or ""
+    out["container_state"] = state
+    out["container_running"] = state == "running"
+    restart_count = attrs.get("RestartCount")
+    if isinstance(restart_count, int):
+        out["restart_count"] = restart_count
+    started = state_dict.get("StartedAt")
+    if isinstance(started, str) and started and started != "0001-01-01T00:00:00Z":
+        out["container_started_at"] = started
 
     if not out["container_running"]:
         return out
 
     # 2. log tail — find last mDNS loaded line + last pool event.
-    # NOTE: `docker logs` writes container stdout AND stderr; many
-    # container loggers (incl. fula_go's zap) emit to stderr. The
-    # subprocess wrapper separates them; we concat so the parser
-    # sees the full stream. Lab 2026-05-28 caught: smoke saw 0 mdns
-    # lines because all 429 lines were in stderr; impl was reading
-    # stdout only.
-    rc, log_stdout, log_stderr = run_subprocess(
-        ["docker", "logs", "--tail", str(_LOG_TAIL_LINES), CONTAINER],
-        timeout_s=_TIMEOUT_S,
-    )
-    log_out = (log_stdout or "") + (log_stderr or "")
-    if rc != 0 or not log_out:
+    # The SDK's logs() includes BOTH stdout and stderr by default
+    # (controllable via stdout=/stderr= kwargs); fula_go's zap logger
+    # writes to stderr so we explicitly request both.
+    try:
+        log_bytes = container.logs(
+            tail=_LOG_TAIL_LINES, stdout=True, stderr=True,
+        )
+        log_out = log_bytes.decode("utf-8", errors="replace") if log_bytes else ""
+    except Exception:
+        log_out = ""
+    if not log_out:
         return out
 
     mdns_count = 0

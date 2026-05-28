@@ -17,13 +17,23 @@ should be running."
 """
 from __future__ import annotations
 
+import os
 import re
 
-from src.tools.diag_impls._helpers import run_subprocess
+
+# Container-side default: docker-compose mounts /usr/bin/fula/.env at
+# the same container path. If a future deployment renames it, override
+# via env.
+ENV_PATH = os.environ.get("BLOX_AI_FULA_ENV_PATH", "/usr/bin/fula/.env")
 
 
-ENV_PATH = "/usr/bin/fula/.env"
-_TIMEOUT_S = 3.0
+def _docker_client():
+    """Lazy docker SDK import — same pattern as fula_go_health."""
+    try:
+        import docker
+        return docker.from_env(timeout=5)
+    except Exception:
+        return None
 
 # Map .env variable name → container name. Built from the canonical
 # docker-compose.yml layout. Missing entries (e.g. kubo doesn't use a
@@ -47,9 +57,10 @@ _HARDCODED_IMAGE_CONTAINERS = {
 def diag_image_versions() -> dict:
     out: dict = {"containers": [], "mismatched_containers": []}
     expected = _read_env_pins(ENV_PATH)
+    client = _docker_client()
 
     for env_var, container in _ENV_VAR_TO_CONTAINER.items():
-        actual_image = _container_image(container)
+        actual_image = _container_image(client, container)
         expected_image = expected.get(env_var)
         entry = {
             "container": container,
@@ -66,7 +77,7 @@ def diag_image_versions() -> dict:
     # Hardcoded-image containers: report current image but no .env
     # pin to compare against.
     for container, image_repo in _HARDCODED_IMAGE_CONTAINERS.items():
-        actual = _container_image(container)
+        actual = _container_image(client, container)
         entry = {
             "container": container,
             "actual_image":   actual or "missing",
@@ -103,12 +114,12 @@ def _read_env_pins(path: str) -> dict:
     return out
 
 
-def _container_image(container: str) -> str | None:
-    rc, out, _ = run_subprocess(
-        ["docker", "inspect", container, "--format", "{{.Config.Image}}"],
-        timeout_s=_TIMEOUT_S,
-    )
-    if rc != 0:
+def _container_image(client, container: str) -> str | None:
+    if client is None:
         return None
-    img = out.strip()
-    return img or None
+    try:
+        c = client.containers.get(container)
+        img = (c.attrs or {}).get("Config", {}).get("Image")
+        return img if isinstance(img, str) and img else None
+    except Exception:
+        return None

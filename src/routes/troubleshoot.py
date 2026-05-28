@@ -44,6 +44,23 @@ class TroubleshootRequest(BaseModel):
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class TreeRequest(BaseModel):
+    """POST /troubleshoot/tree body (Phase 1.c).
+
+    The deterministic-tree counterpart to /troubleshoot. Same SSE event
+    vocabulary; same session/event_buffer/resume infrastructure; same
+    /execute-action approval flow for recommended actions. Difference:
+    the events come from a YAML-authored tree walker, not the LLM.
+
+    Used by the app's quick-start buttons (the user picked a scenario
+    explicitly) and by the classifier endpoint (the LLM mapped a
+    free-text prompt to a known scenario_id)."""
+    model_config = {"extra": "forbid"}
+
+    scenario_id: str = Field(min_length=1, max_length=64)
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class UserReplyRequest(BaseModel):
     """POST /troubleshoot/user-reply body. Mirrors fula-ota's
     user_reply_request.schema.json shape."""
@@ -188,6 +205,118 @@ async def _stream_from_buffer(
 
         async with session.cond:
             await session.cond.wait()
+
+
+async def _drive_tree_into_buffer(
+    session: SessionState,
+    tree_runner,
+    scenario_id: str,
+) -> None:
+    """Phase 1.c counterpart to _drive_generator_into_buffer. Walks the
+    tree and writes each emitted event into the session's buffer. The
+    SSE consumer (and any resume callers) read the buffer; they don't
+    talk to the tree runner directly. Apps/box's resume protocol
+    works unchanged because the event vocabulary is the same."""
+    try:
+        async for event in tree_runner.run(scenario_id):
+            await session.append_event(event)
+    except asyncio.CancelledError:
+        await session.mark_done()
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.exception("tree runner failed session=%s scenario=%s",
+                         session.session_id, scenario_id)
+        try:
+            await session.append_event({
+                "type": "error",
+                "code": "tree_runner_crashed",
+                "message": str(e)[:200],
+                "recoverable": False,
+            })
+        except Exception:
+            pass
+    finally:
+        await session.mark_done()
+
+
+@router.post("/troubleshoot/tree")
+async def troubleshoot_tree(req: TreeRequest, request: Request) -> Response:
+    """Phase 1.c — deterministic tree runner endpoint.
+
+    Mirrors POST /troubleshoot's session/buffer/SSE plumbing exactly;
+    the only difference is the generator (tree runner vs LLM bridge).
+    503 when the tree runner failed to load at startup (missing
+    BLOX_AI_TREES_DIR or YAML validation error).
+    """
+    tree_runner = getattr(request.app.state, "tree_runner", None)
+    if tree_runner is None:
+        return JSONResponse(
+            status_code=503,
+            content=_error_body(
+                "tree_runner_unavailable",
+                "trees did not load at startup; check container logs",
+            ),
+        )
+    # 404 on unknown scenario — caller bug, not a transient error.
+    if req.scenario_id not in tree_runner.trees:
+        return JSONResponse(
+            status_code=404,
+            content=_error_body(
+                "unknown_scenario_id",
+                f"available: {sorted(tree_runner.trees.keys())}",
+            ),
+        )
+
+    session_mgr = request.app.state.session_manager
+    if req.session_id:
+        session = session_mgr.get(req.session_id)
+        if session is None:
+            session = session_mgr.create(session_id=req.session_id)
+    else:
+        session = session_mgr.create()
+
+    if (
+        session.generator_task is not None
+        and not getattr(session.generator_task, "done", lambda: True)()
+        and not session.generator_done
+    ):
+        return JSONResponse(
+            status_code=409,
+            content=_error_body(
+                "session_already_active",
+                "use GET /troubleshoot/resume?session_id=...&from=N to reattach",
+            ),
+        )
+
+    # Reset buffer state for the new run (matches /troubleshoot).
+    session.event_buffer = []
+    session.next_seq = 0
+    session.dropped_count = 0
+    session.generator_done = False
+    session.consumer_generation += 1
+    async with session.cond:
+        session.cond.notify_all()
+
+    session.generator_task = asyncio.create_task(
+        _drive_tree_into_buffer(session, tree_runner, req.scenario_id),
+        name=f"blox-ai-tree-{session.session_id}-{req.scenario_id}",
+    )
+
+    async def sse_stream():
+        try:
+            async for chunk in _stream_from_buffer(session, from_seq=0):
+                yield chunk
+        finally:
+            session_mgr.touch(session.session_id)
+
+    return StreamingResponse(
+        sse_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/troubleshoot")

@@ -21,9 +21,11 @@ from fastapi import FastAPI
 
 from src.runtime.mock_backend import MockBackend
 from src.runtime.runbook_loader import RunbookLoader
+from src.runtime.tree_dsl import TreeValidationError, load_tree_registry
+from src.runtime.tree_runner import TreeRunner
 from src.session.manager import SessionManager
 from src.tools.approval_token import ApprovalTokenSigner
-from src.tools.diag_impls import RealDiagExecutor
+from src.tools.diag_impls import RealDiagExecutor, known_tools
 from src.tools.executor import ActionExecutor, WhitelistError, load_whitelist
 from src.schemas import SchemaRegistry
 from src.routes import cancel, diag, execute, feedback, health, pending, troubleshoot
@@ -98,6 +100,46 @@ async def lifespan(app: FastAPI):
             tool_executor=app.state.tool_executor,
             action_signer=app.state.approval_signer.sign,
             runbook_loader=None,  # rewired below once runbook_loader exists
+        )
+
+    # Phase 1.c: deterministic tree runner. Loads YAML trees from
+    # BLOX_AI_TREES_DIR; cross-validates against the diag tool set +
+    # the action whitelist loaded above. Soft-fail in dev — if the
+    # tree dir is missing or trees fail to load, /troubleshoot/tree
+    # returns 503 but other endpoints still work.
+    trees_dir = os.environ.get(
+        "BLOX_AI_TREES_DIR",
+        "/etc/fula/blox-ai/trees",
+    )
+    app.state.tree_runner = None
+    if os.path.isdir(trees_dir):
+        try:
+            known_action_names = set()
+            if app.state.action_executor is not None:
+                wl = app.state.action_executor.whitelist
+                # LoadedWhitelist exposes tier_2_names / tier_3_names
+                # as frozensets per src/tools/executor.py.
+                known_action_names |= set(wl.tier_2_names)
+                known_action_names |= set(wl.tier_3_names)
+            diag_short = {t.removeprefix("diag/") for t in known_tools()}
+            registry = load_tree_registry(
+                trees_dir,
+                known_diag_tools=diag_short,
+                known_action_names=known_action_names,
+            )
+            app.state.tree_runner = TreeRunner(
+                trees=registry,
+                tool_executor=app.state.tool_executor,
+            )
+            logger.info(
+                "tree_runner wired with %d trees: %s",
+                len(registry), sorted(registry.keys()),
+            )
+        except TreeValidationError as e:
+            logger.error("tree registry load failed: %s; /troubleshoot/tree will 503", e)
+    else:
+        logger.info(
+            "trees_dir %s not present; /troubleshoot/tree will 503", trees_dir,
         )
 
     # C5: in-memory session registry for /troubleshoot conversations.

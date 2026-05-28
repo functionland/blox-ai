@@ -77,13 +77,30 @@ class EmitRecommendation:
 
 @dataclass
 class Then:
-    """Right-hand side of a branch: what to emit + where to go next."""
+    """Right-hand side of a branch: what to emit + where to go next.
+
+    Three control-flow primitives for cross-/sub-tree composition:
+      - next: jump to another node in this tree (or to a named subtree).
+        Local-only; doesn't cross tree boundaries.
+      - goto_tree: REDIRECT to a different top-level tree's entry.
+        Caller's cascade ENDS unconditionally after the target tree
+        finishes. Use when classifier guessed wrong and we want to
+        redirect to the right scenario.
+      - include_tree: CALL a different top-level tree's entry, then
+        come BACK. If the called tree emitted a verdict, caller's
+        cascade halts (we have a definitive answer). If the called
+        tree did NOT emit a verdict, caller continues with `next:`.
+        Use to compose hierarchies: not-earning INCLUDES disconnected;
+        if disconnected found the problem, stop; else continue with
+        cluster + pool checks.
+    """
     emit_thought: Optional[str] = None
     emit_verdict: Optional[EmitVerdict] = None
     emit_recommendation: Optional[EmitRecommendation] = None
-    next: Optional[str] = None        # next node id (or subtree name)
-    goto_tree: Optional[str] = None   # cross-tree redirect
-    stop: bool = False                # halt cascade
+    next: Optional[str] = None           # next node id (or subtree name)
+    goto_tree: Optional[str] = None      # cross-tree redirect (one-way)
+    include_tree: Optional[str] = None   # cross-tree call (returns if no verdict)
+    stop: bool = False                   # halt cascade
 
 
 @dataclass
@@ -305,6 +322,7 @@ def _parse_then(raw: Any, tree_id: str, node_id: str) -> Then:
         emit_recommendation=emit_rec,
         next=raw.get("next") if isinstance(raw.get("next"), str) else None,
         goto_tree=raw.get("goto_tree") if isinstance(raw.get("goto_tree"), str) else None,
+        include_tree=raw.get("include_tree") if isinstance(raw.get("include_tree"), str) else None,
         stop=bool(raw.get("stop", False)),
     )
 
@@ -385,6 +403,11 @@ def _validate_tree_refs(
                 raise TreeValidationError(
                     f"tree {tree.id!r} node {node.id!r}: "
                     f"goto_tree references unknown tree {then.goto_tree!r}"
+                )
+            if then.include_tree is not None and then.include_tree not in registry:
+                raise TreeValidationError(
+                    f"tree {tree.id!r} node {node.id!r}: "
+                    f"include_tree references unknown tree {then.include_tree!r}"
                 )
     # Recursively validate sub-trees.
     for sub in tree.subtrees.values():

@@ -64,11 +64,18 @@ DiagExecutor = Callable[[str, dict], Awaitable[dict]]
 @dataclass
 class TreeRunContext:
     """Per-run state — diag results cache + facts accumulator + visited
-    node ids (for cycle bound + final summary)."""
+    node ids (for cycle bound + final summary).
+
+    `red_verdict_emitted`: only RED verdicts (definitive problems)
+    halt include_tree callers. Yellow + green verdicts let the caller
+    continue — so when not-earning INCLUDES disconnected and
+    disconnected emits a yellow "everything looks healthy" verdict,
+    not-earning continues to its earnings-specific checks."""
     facts: dict = field(default_factory=dict)
     diag_cache: dict = field(default_factory=dict)   # (tool, args_key) → result
-    visited: list[tuple[str, str]] = field(default_factory=list)  # (tree_id, node_id)
+    visited: list[tuple[str, str]] = field(default_factory=list)
     verdict_emitted: bool = False
+    red_verdict_emitted: bool = False
     recommendations_emitted: int = 0
     tree_stack: list[str] = field(default_factory=list)
 
@@ -222,6 +229,8 @@ class TreeRunner:
                     },
                 }
                 ctx.verdict_emitted = True
+                if then.emit_verdict.severity == "red":
+                    ctx.red_verdict_emitted = True
 
             if then.emit_recommendation is not None:
                 yield self._make_recommendation_event(then.emit_recommendation)
@@ -246,6 +255,35 @@ class TreeRunner:
                 async for ev in self._walk_tree(self.trees[then.goto_tree], ctx):
                     yield ev
                 return
+            if then.include_tree is not None:
+                # Cross-tree CALL: walk the target tree, then return.
+                # If the called tree emitted a verdict, the cascade
+                # halts (we have a definitive answer; no point
+                # continuing the caller). Otherwise continue with
+                # `next:`. The OUTER run() does the synth-verdict
+                # post-walk; _walk_tree itself never synths, so
+                # `verdict_emitted` flipping during the include is
+                # always a real explicit verdict.
+                if then.include_tree not in self.trees:
+                    yield self._error_event(
+                        "unknown_include_tree",
+                        f"tree {tree.id!r} node {node.id!r}: "
+                        f"include_tree={then.include_tree!r} not registered",
+                        recoverable=True,
+                    )
+                    return
+                red_before = ctx.red_verdict_emitted
+                async for ev in self._walk_tree(self.trees[then.include_tree], ctx):
+                    yield ev
+                # Halt caller only on RED verdicts (definitive problems).
+                # Yellow/green verdicts from the included tree let the
+                # caller continue with its own scenario-specific checks —
+                # so when not-earning INCLUDES disconnected and
+                # disconnected emits a yellow "everything looks healthy"
+                # verdict, not-earning continues checking cluster + chain.
+                if ctx.red_verdict_emitted and not red_before:
+                    return   # included tree found a definitive answer
+                # else: fall through to `current_id = then.next` below
             current_id = then.next   # may be None → halt
 
     def _match_branch(

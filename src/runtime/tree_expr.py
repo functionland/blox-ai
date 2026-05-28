@@ -115,21 +115,27 @@ def _make_evaluator(names: Mapping[str, Any]) -> EvalWithCompoundTypes:
     return evl
 
 
+def _normalize(expr: str) -> str:
+    """Collapse YAML `|` literal-block newlines into spaces so authors
+    can split long expressions across multiple lines for readability.
+    simpleeval delegates to ast.parse which rejects bare newlines
+    inside binary ops (`a == 1 and\nb == 2` is a SyntaxError)."""
+    return " ".join(expr.split())
+
+
 def validate_expression(expr: str) -> None:
     """Parse-check an expression without evaluating. Called at tree
     LOAD time so a broken `when:` syntax fails before any troubleshoot
     session starts. Raises ExpressionParseError on failure."""
+    norm = _normalize(expr)
+    if not norm:
+        raise ExpressionParseError("empty expression")
     try:
-        # Use a minimal context (empty `result`/`facts`); evaluation
-        # against missing names would raise NameNotDefined at eval, NOT
-        # at parse, so we ONLY check parse-ability here.
         evl = _make_evaluator({})
-        evl.parse(expr)
+        evl.parse(norm)
     except (SyntaxError, InvalidExpression) as e:
         raise ExpressionParseError(f"cannot parse {expr!r}: {e}") from e
     except Exception as e:
-        # simpleeval can raise various exceptions during parse; treat
-        # anything unexpected as a load-time failure too.
         raise ExpressionParseError(f"cannot parse {expr!r}: {e}") from e
 
 
@@ -140,12 +146,11 @@ def evaluate(expr: str, context: Mapping[str, Any]) -> bool:
 
     The caller is expected to have wrapped any dict-shaped values in
     DotDict (via to_dotdict) so attribute access works."""
+    norm = _normalize(expr)
     try:
         evl = _make_evaluator(context)
-        result = evl.eval(expr)
+        result = evl.eval(norm)
     except InvalidExpression as e:
-        # InvalidExpression covers NameNotDefined + FunctionNotDefined
-        # + AttributeDoesNotExist + similar simpleeval guard rails.
         raise ExpressionEvalError(f"cannot evaluate {expr!r}: {e}") from e
     except (KeyError, AttributeError, TypeError, ZeroDivisionError) as e:
         raise ExpressionEvalError(f"runtime error in {expr!r}: {e}") from e

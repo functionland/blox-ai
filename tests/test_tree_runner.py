@@ -365,6 +365,161 @@ def test_goto_tree_cross_tree_redirect():
     assert verdicts[-1]["payload"]["root_cause"] == "redirected"
 
 
+def test_include_tree_walks_then_returns_when_no_verdict():
+    """include_tree: walk the called tree; if no verdict landed,
+    continue with `next:`. This is the 'not-earning INCLUDES
+    disconnected' composition pattern."""
+    runner = _build_runner({
+        "outer": """
+            id: outer
+            version: 1
+            title: x
+            nodes:
+              - id: a
+                branches:
+                  - default:
+                      include_tree: inner
+                      next: b
+              - id: b
+                branches:
+                  - default:
+                      emit_verdict:
+                        summary: from-outer-after-inner
+                        severity: green
+                        root_cause: outer_continued
+                      stop: true
+        """,
+        "inner": """
+            id: inner
+            version: 1
+            title: y
+            nodes:
+              - id: only
+                branches:
+                  - default:
+                      emit_thought: inner-ran-but-no-verdict
+                      stop: true
+        """,
+    })
+    events = asyncio.run(_collect(runner.run("outer")))
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert len(verdicts) == 1
+    assert verdicts[0]["payload"]["root_cause"] == "outer_continued"
+    thoughts = [e for e in events if e["type"] == "thought"]
+    assert any("inner-ran-but-no-verdict" in t["payload"] for t in thoughts)
+
+
+def test_include_tree_halts_caller_only_when_included_emits_red():
+    """RED verdict from the included tree = definitive answer; halt
+    caller. Yellow/green from include do NOT halt — caller continues
+    with its scenario-specific checks."""
+    runner = _build_runner({
+        "outer": """
+            id: outer
+            version: 1
+            title: x
+            nodes:
+              - id: a
+                branches:
+                  - default:
+                      include_tree: inner
+                      next: b
+              - id: b
+                branches:
+                  - default:
+                      emit_verdict:
+                        summary: should-not-be-reached
+                        severity: red
+                        root_cause: outer_continued
+                      stop: true
+        """,
+        "inner": """
+            id: inner
+            version: 1
+            title: y
+            nodes:
+              - id: only
+                branches:
+                  - default:
+                      emit_verdict:
+                        summary: inner-found-it
+                        severity: red
+                        root_cause: inner_verdict
+                      stop: true
+        """,
+    })
+    events = asyncio.run(_collect(runner.run("outer")))
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    # Only the inner verdict should appear; outer.b never ran.
+    assert len(verdicts) == 1
+    assert verdicts[0]["payload"]["root_cause"] == "inner_verdict"
+
+
+def test_include_tree_continues_caller_when_included_emits_yellow():
+    """Yellow verdict from include should NOT halt the caller."""
+    runner = _build_runner({
+        "outer": """
+            id: outer
+            version: 1
+            title: x
+            nodes:
+              - id: a
+                branches:
+                  - default:
+                      include_tree: inner
+                      next: b
+              - id: b
+                branches:
+                  - default:
+                      emit_verdict:
+                        summary: outer-continued-after-yellow
+                        severity: green
+                        root_cause: outer_kept_going
+                      stop: true
+        """,
+        "inner": """
+            id: inner
+            version: 1
+            title: y
+            nodes:
+              - id: only
+                branches:
+                  - default:
+                      emit_verdict:
+                        summary: inner-yellow
+                        severity: yellow
+                        root_cause: inner_indeterminate
+                      stop: true
+        """,
+    })
+    events = asyncio.run(_collect(runner.run("outer")))
+    codes = [e["payload"]["root_cause"] for e in events if e["type"] == "verdict"]
+    # Both verdicts present; outer kept going past the yellow inner verdict.
+    assert "inner_indeterminate" in codes
+    assert "outer_kept_going" in codes
+
+
+def test_include_tree_to_unknown_tree_emits_error():
+    runner = _build_runner({
+        "outer": """
+            id: outer
+            version: 1
+            title: x
+            nodes:
+              - id: a
+                branches:
+                  - default:
+                      include_tree: nonexistent
+                      next: b
+              - id: b
+                branches: [{default: {stop: true}}]
+        """,
+    })
+    events = asyncio.run(_collect(runner.run("outer")))
+    errors = [e for e in events if e["type"] == "error"]
+    assert any(e["code"] == "unknown_include_tree" for e in errors)
+
+
 def test_goto_tree_to_unknown_tree_emits_error():
     runner = _build_runner({
         "first": """

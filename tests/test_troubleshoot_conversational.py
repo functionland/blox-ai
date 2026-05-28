@@ -36,9 +36,13 @@ def test_user_reply_no_pending_question_returns_400(client):
     # Create a session via /troubleshoot but don't trigger a user_question
     r0 = client.post("/troubleshoot", json={"prompt": "just diagnose"})
     assert r0.status_code == 200
-    # Extract session_id from the first SSE event
-    first_line = r0.text.split("\n\n")[0]
-    payload = json.loads(first_line[len("data: "):])
+    # Extract session_id from the first SSE event. 2026-05-28 resume
+    # support adds an `id: <seq>\n` field BEFORE the `data:` line on
+    # each event block, so we scan for `data:` instead of slicing the
+    # raw first line.
+    first_block = r0.text.split("\n\n")[0]
+    data_line = next(L for L in first_block.split("\n") if L.startswith("data: "))
+    payload = json.loads(data_line[len("data: "):])
     sid = payload["session_id"]
     # Now post a user-reply with no pending question
     r = client.post("/troubleshoot/user-reply", json={
@@ -115,10 +119,12 @@ def test_phone_context_validates_body_envelope(client):
 
 
 def _open_session(client) -> str:
-    """Helper: mint a session via a /troubleshoot call, return session_id."""
+    """Helper: mint a session via a /troubleshoot call, return session_id.
+    Tolerant of the 2026-05-28 SSE format with leading `id:` field."""
     r = client.post("/troubleshoot", json={"prompt": "just diagnose"})
-    first = r.text.split("\n\n")[0]
-    payload = json.loads(first[len("data: "):])
+    first_block = r.text.split("\n\n")[0]
+    data_line = next(L for L in first_block.split("\n") if L.startswith("data: "))
+    payload = json.loads(data_line[len("data: "):])
     return payload["session_id"]
 
 
@@ -228,12 +234,17 @@ def test_user_question_event_emitted_when_prompt_asks(client):
 
     assert r.status_code == 200
     assert reply_done["ok"], "reply post never succeeded"
-    # The stream should contain user_question + user_reply_received
+    # The stream should contain user_question + user_reply_received.
+    # 2026-05-28: each event block now leads with `id:` then `data:`.
     events = []
-    for raw in r.text.split("\n\n"):
-        raw = raw.strip()
-        if raw.startswith("data: "):
-            events.append(json.loads(raw[len("data: "):]))
+    for block in r.text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        for line in block.split("\n"):
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: "):]))
+                break
     types = [e["type"] for e in events]
     assert "user_question" in types, (
         f"expected user_question event; got {types}"

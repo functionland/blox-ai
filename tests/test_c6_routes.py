@@ -23,8 +23,10 @@ def client_with_tmp_feedback_log(client, tmp_path):
 
 def _open_session(client) -> str:
     r = client.post("/troubleshoot", json={"prompt": "just diagnose"})
-    first = r.text.split("\n\n")[0]
-    return json.loads(first[len("data: "):])["session_id"]
+    first_block = r.text.split("\n\n")[0]
+    # 2026-05-28 resume support: SSE events now have `id:` then `data:`.
+    data_line = next(L for L in first_block.split("\n") if L.startswith("data: "))
+    return json.loads(data_line[len("data: "):])["session_id"]
 
 
 def test_feedback_happy_path_writes_log_line(client_with_tmp_feedback_log):

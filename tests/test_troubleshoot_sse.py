@@ -27,18 +27,44 @@ import pytest
 def _parse_sse(text: str) -> list[dict]:
     """Parse a complete SSE response body into a list of event dicts.
 
-    Each event is `data: <json>\\n\\n`. The test client buffers everything
-    into one string, so we split on the empty-line terminator.
+    Each SSE event may carry multiple field lines (id, event, data,
+    retry) separated by `\\n`, terminated by an empty line (`\\n\\n`).
+    Per the 2026-05-28 resume feature each event now ALSO carries an
+    `id: <seq>` line that the client uses as lastEventId. We pluck out
+    the JSON-bearing `data:` line and parse it.
     """
     events = []
-    for raw in text.split("\n\n"):
-        raw = raw.strip()
-        if not raw:
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
             continue
-        if raw.startswith("data: "):
-            payload = raw[len("data: "):]
-            events.append(json.loads(payload))
+        for line in block.split("\n"):
+            line = line.rstrip("\r")
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: "):]))
+                break  # one data line per event in this codebase
     return events
+
+
+def _parse_sse_with_ids(text: str) -> list[tuple[str | None, dict]]:
+    """Like _parse_sse but also returns the SSE `id:` field (the
+    monotonic seq number for resume). Used by resume tests."""
+    out = []
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        sid = None
+        data = None
+        for line in block.split("\n"):
+            line = line.rstrip("\r")
+            if line.startswith("id: "):
+                sid = line[len("id: "):]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: "):])
+        if data is not None:
+            out.append((sid, data))
+    return out
 
 
 def _post_troubleshoot(client, prompt: str = "my device is slow", **extra):
@@ -464,3 +490,172 @@ def test_each_call_without_session_id_mints_a_fresh_one(client):
     a = _events_from_response(_post_troubleshoot(client))
     b = _events_from_response(_post_troubleshoot(client))
     assert a[0]["session_id"] != b[0]["session_id"]
+
+
+# ---------------------------------------------------------------------------
+# Resume (mid-session reattach after SSE disconnect) — 2026-05-28
+# ---------------------------------------------------------------------------
+
+def test_each_event_carries_a_monotonic_id(client):
+    """Resume relies on each event carrying an `id:` SSE field with a
+    monotonic per-session sequence number. Client persists the highest
+    seen id and supplies it as `?from=` on resume so the server can
+    skip already-delivered events."""
+    pairs = _parse_sse_with_ids(_post_troubleshoot(client).text)
+    seen = [int(sid) for sid, _ in pairs if sid is not None and sid != "-1"]
+    assert seen, f"expected SSE id fields on every event; got {pairs!r}"
+    # Monotonic + starting from 0
+    assert seen == sorted(seen), f"ids not monotonic: {seen}"
+    assert seen[0] == 0, f"first id should be 0; got {seen[0]}"
+
+
+def test_resume_404s_on_unknown_session_id(client):
+    r = client.get("/troubleshoot/resume", params={"session_id": "nonexistent", "from": 0})
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"] == "session_not_found"
+
+
+def test_resume_from_zero_replays_full_buffer(client):
+    """After a complete /troubleshoot run, calling /troubleshoot/resume
+    with from=0 yields exactly the same events the original POST did.
+    Proves the buffer survives generator completion and that resume
+    works as a replay path (the use case: user closed app mid-session,
+    reopens, server still has the buffered events)."""
+    original = _events_from_response(_post_troubleshoot(client))
+    sid = original[0]["session_id"]
+    r = client.get("/troubleshoot/resume", params={"session_id": sid, "from": 0})
+    assert r.status_code == 200
+    replayed = _events_from_response(r)
+    # Same sequence (compare type + key field per type to avoid jitter
+    # in approval_token / non-deterministic fields)
+    orig_types = [e["type"] for e in original]
+    repl_types = [e["type"] for e in replayed]
+    assert orig_types == repl_types, f"replay shape diverged: {orig_types} vs {repl_types}"
+    # Session_id matches
+    assert replayed[0]["session_id"] == sid
+
+
+def test_resume_from_midstream_skips_already_delivered_events(client):
+    """Client persists lastEventId (the highest seq it received) and
+    supplies it as ?from=N+1 on resume. Server yields only events
+    with seq > N. Proves we don't double-deliver."""
+    pairs = _parse_sse_with_ids(_post_troubleshoot(client).text)
+    sid = next(e["session_id"] for _, e in pairs if e.get("type") == "session_started")
+    real_ids = [int(s) for s, _ in pairs if s is not None and s != "-1"]
+    cutoff = real_ids[len(real_ids) // 2]  # midpoint
+    r = client.get(
+        "/troubleshoot/resume",
+        params={"session_id": sid, "from": cutoff + 1},
+    )
+    assert r.status_code == 200
+    later_pairs = _parse_sse_with_ids(r.text)
+    later_ids = [int(s) for s, _ in later_pairs if s is not None and s != "-1"]
+    # All replayed ids are strictly greater than cutoff
+    assert all(i > cutoff for i in later_ids), (
+        f"resume from {cutoff+1} returned an id <= cutoff: {later_ids}"
+    )
+    # And the full tail (everything after cutoff) is present
+    expected_tail = [i for i in real_ids if i > cutoff]
+    assert later_ids == expected_tail, (
+        f"resume tail mismatch: expected {expected_tail}, got {later_ids}"
+    )
+
+
+def test_truncation_marker_synthesized_when_from_predates_buffer_head(client):
+    """When the client supplies a `from` that's older than the oldest
+    seq still in the buffer (buffer overflowed during the disconnect
+    window), the server injects a synthetic `thought` event explaining
+    the gap. Reused-type (thought) so we don't grow the SSE schema for
+    a flow-control concern."""
+    # Drive a normal session so a session is registered + the buffer
+    # finishes naturally, then mutate the buffer in place to simulate
+    # the post-truncation state.
+    pairs = _parse_sse_with_ids(_post_troubleshoot(client).text)
+    sid = next(e["session_id"] for _, e in pairs if e.get("type") == "session_started")
+    session = client.app.state.session_manager.get(sid)
+    # Force a synthetic gap: pretend events 0-4 were evicted from the
+    # head, the buffer now starts at seq=5. dropped_count is for
+    # observability — _stream_from_buffer derives the marker text
+    # from the buffer head vs from_seq, not from dropped_count.
+    session.event_buffer = [(5, {"type": "thought", "payload": "head"})]
+    session.dropped_count = 5
+
+    r = client.get(
+        "/troubleshoot/resume",
+        params={"session_id": sid, "from": 0},
+    )
+    assert r.status_code == 200
+    events = _events_from_response(r)
+    # First event must be the truncation marker (thought, mentions
+    # "dropped" — the exact wording is documented in
+    # _stream_from_buffer).
+    assert events, "expected at least the truncation marker + the head event"
+    assert events[0]["type"] == "thought"
+    assert "dropped" in events[0]["payload"].lower(), (
+        f"expected 'dropped' in marker; got {events[0]['payload']!r}"
+    )
+    # Second event is the actual buffered head event
+    assert events[1]["payload"] == "head"
+
+
+def test_post_to_active_session_returns_409(client):
+    """Two concurrent POST /troubleshoot calls to the same session_id
+    would spawn duplicate generator tasks writing into one buffer —
+    chaos. Reject the second with 409 + a hint to use /resume.
+
+    Direct state injection: we don't actually run a parallel generator
+    (that risks hanging the test); we just plant a fake-still-running
+    task on the session_id and verify the route guards against it."""
+    fixed_sid = "active-session-409-test"
+    session_mgr = client.app.state.session_manager
+    session = session_mgr.create(session_id=fixed_sid)
+
+    class _FakeRunningTask:
+        def done(self):
+            return False
+
+    session.generator_task = _FakeRunningTask()
+    session.generator_done = False
+
+    r = client.post("/troubleshoot",
+                    json={"prompt": "p", "session_id": fixed_sid})
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["error"] == "session_already_active"
+    # Resume hint in detail
+    assert "resume" in body.get("detail", "").lower()
+
+
+def test_post_to_completed_session_starts_fresh_generator(client):
+    """The 409 guard is gated on `not generator_done` — once a session's
+    prior run has finished, POSTing again on the same session_id starts
+    a fresh generator and resets the buffer. Lets the client recycle a
+    session_id after a verdict instead of being stuck with a 409."""
+    fixed_sid = "completed-session-reuse-test"
+    session_mgr = client.app.state.session_manager
+    session = session_mgr.create(session_id=fixed_sid)
+
+    class _FakeCompletedTask:
+        def done(self):
+            return True
+
+    session.generator_task = _FakeCompletedTask()
+    session.generator_done = True
+    session.next_seq = 999  # simulate prior session activity
+    session.event_buffer = [(998, {"type": "thought", "payload": "stale"})]
+
+    r = client.post("/troubleshoot",
+                    json={"prompt": "p", "session_id": fixed_sid})
+    assert r.status_code == 200
+    events = _events_from_response(r)
+    # New session reset seq to 0; first event is session_started with
+    # the SAME session_id (caller-supplied echoes back).
+    assert events[0]["type"] == "session_started"
+    assert events[0]["session_id"] == fixed_sid
+    # Buffer was reset
+    fresh_session = session_mgr.get(fixed_sid)
+    assert fresh_session.next_seq > 0  # populated by the new run
+    # Stale "thought" payload from prior buffer should NOT appear
+    payloads = [e.get("payload") for e in events if e.get("type") == "thought"]
+    assert "stale" not in payloads

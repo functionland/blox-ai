@@ -15,14 +15,20 @@ import pytest
 
 def _open_session_and_get_recommendation(client) -> dict:
     """Run /troubleshoot end-to-end, return the recommended_action event
-    (which carries action_id + approval_token + action_name + args)."""
+    (which carries action_id + approval_token + action_name + args).
+    2026-05-28: SSE event blocks now lead with `id:` for resume support;
+    scan for `data:` per line instead of slicing the block."""
     r = client.post("/troubleshoot", json={"prompt": "diagnose"})
     assert r.status_code == 200
     events = []
-    for raw in r.text.split("\n\n"):
-        raw = raw.strip()
-        if raw.startswith("data: "):
-            events.append(json.loads(raw[len("data: "):]))
+    for block in r.text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        for line in block.split("\n"):
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: "):]))
+                break
     rec = next((e for e in events if e["type"] == "recommended_action"), None)
     assert rec is not None
     return rec

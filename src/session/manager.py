@@ -27,6 +27,14 @@ logger = logging.getLogger("blox-ai.session")
 
 DEFAULT_TTL_SEC = 30 * 60  # 30 minutes
 DEFAULT_MAX_SESSIONS = 50
+# Resume support — per-session event buffer cap. ~1 KB/event × 500 cap ×
+# 50 sessions ≈ 25 MB worst-case; comfortable on a device with 7-8 GB
+# RAM. On overflow we drop the oldest event AND inject a synthetic
+# `thought` truncation marker (see SessionState.append_event) so the
+# resuming consumer sees a plain-text note about the gap. Reusing
+# `thought` avoids touching the SSE schema for a flow-control concern
+# (advisor input: don't grow the schema for transport metadata).
+DEFAULT_BUFFER_CAP = 500
 
 
 @dataclass
@@ -52,6 +60,58 @@ class SessionState:
     # for the executor; the HMAC token binds to action_id, the
     # dispatch table needs action_name + args.
     issued_recommendations: dict[str, dict] = field(default_factory=dict)
+    # ---- Resume support (added 2026-05-28) -----------------------------
+    # event_buffer holds (seq, event) tuples in arrival order. seq is
+    # monotonic per-session — even on truncation we keep counting up so
+    # gaps in seq let the consumer detect dropped events.
+    event_buffer: list[tuple[int, dict]] = field(default_factory=list)
+    next_seq: int = 0
+    # Total events dropped from the head of the buffer due to cap.
+    # Cumulative across the session lifetime. Surfaced to the consumer
+    # as the marker payload when a resume's `from` is older than the
+    # oldest buffered seq.
+    dropped_count: int = 0
+    # Set True once the generator task finishes (verdict reached, error,
+    # or session_cancelled). Consumers exit their wait loop on this.
+    generator_done: bool = False
+    # The detached generator task. Created on the first /troubleshoot
+    # POST for this session; subsequent /resume calls reattach to the
+    # same task's output (via the buffer). NEVER awaited from the SSE
+    # handler — that's the whole point of the resume feature (SSE
+    # consumer disconnect must NOT cancel the generator).
+    generator_task: object | None = None
+    # Last-wins consumer policy: each new SSE consumer increments this
+    # token; consumers loop while their captured token equals the
+    # current value, exit when a newer consumer has taken over. Avoids
+    # multiple SSE streams writing duplicate frames to the network.
+    consumer_generation: int = 0
+    # Producer/consumer wake — asyncio.Condition (not Event) per
+    # advisor input: Event has the "lost wake between clear and wait"
+    # race. Condition's notify_all + acquire pattern is race-free for
+    # multiple consumers, and the migration from single-consumer to
+    # last-wins doesn't require touching wake logic.
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+    async def append_event(self, event: dict) -> None:
+        """Append an event to the buffer + wake any waiting consumer.
+        Drops the oldest event on overflow (incrementing dropped_count
+        so the next resume can synthesize a truncation marker)."""
+        seq = self.next_seq
+        self.next_seq += 1
+        self.event_buffer.append((seq, event))
+        if len(self.event_buffer) > DEFAULT_BUFFER_CAP:
+            self.event_buffer.pop(0)
+            self.dropped_count += 1
+        async with self.cond:
+            self.cond.notify_all()
+
+    async def mark_done(self) -> None:
+        """Mark the generator as finished + wake all consumers so they
+        exit their stream loop. Idempotent — safe to call from the
+        generator wrapper's try/except/finally branches."""
+        self.generator_done = True
+        async with self.cond:
+            self.cond.notify_all()
 
 
 class SessionManager:

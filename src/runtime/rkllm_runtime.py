@@ -1140,6 +1140,16 @@ class RKLLMBackend:
         next_role: str = "user"
         next_content: str = first_turn_content
         next_keep_history: int = 0   # 0 on first turn; 1 thereafter
+        # next_thinking gates the per-call enable_thinking flag. Default
+        # follows the backend-level filename gate; force-verdict retries
+        # flip this off so the entire max_new_tokens budget can land on
+        # the structured <verdict> block (lab 2026-05-27: with thinking
+        # on, Qwen3-1.7B exhausts the budget inside <think>…</think>
+        # and never reaches the structured tail — the bridge then emits
+        # the synthetic "Model did not produce a structured verdict"
+        # fallback). Diagnostic data is already in KV cache from prior
+        # turns, so the retry only needs to format the conclusion.
+        next_thinking: bool = self._enable_thinking
 
         for turn in range(MAX_TURNS):
             # Last-chance: at MAX_TURNS-1 without a verdict, send the
@@ -1154,6 +1164,7 @@ class RKLLMBackend:
                 next_role = "user"
                 next_content = FORCE_VERDICT_DIRECTIVE
                 next_keep_history = 1  # keep prior KV
+                next_thinking = False  # see next_thinking init comment
                 force_verdict_attempted = True
 
             try:
@@ -1162,11 +1173,11 @@ class RKLLMBackend:
                 # routes the message to the right slot in the template.
                 output = await loop.run_in_executor(
                     None,
-                    lambda r=next_role, c=next_content, kh=next_keep_history: (
+                    lambda r=next_role, c=next_content, kh=next_keep_history, t=next_thinking: (
                         self._runtime.generate(
                             c,
                             role=r,
-                            enable_thinking=self._enable_thinking,
+                            enable_thinking=t,
                             keep_history=kh,
                             timeout_s=PER_TURN_TIMEOUT_S,
                         )
@@ -1200,9 +1211,11 @@ class RKLLMBackend:
             # structured response (tool calls, verdict, recommendations)
             # only exists AFTER `</think>`. Pre-strip so the parsers
             # can't be tripped by stray XML mentions inside the model's
-            # reasoning prose ("I should call <tool_call>").
+            # reasoning prose ("I should call <tool_call>"). Gate on
+            # the per-turn flag (next_thinking) — force-verdict retries
+            # run with thinking off so no `<think>` block exists to strip.
             output_for_parsing = (
-                _strip_think(output) if self._enable_thinking else output
+                _strip_think(output) if next_thinking else output
             )
 
             # NOTE: history list is no longer rebuilt-per-turn — v1.2.3
@@ -1223,7 +1236,7 @@ class RKLLMBackend:
             if thought_text:
                 # SSE thought schema: minLength 1, maxLength 4000
                 yield {"type": "thought", "payload": thought_text[:4000]}
-            elif self._enable_thinking:
+            elif next_thinking:
                 # Qwen 3 turn was 100% structured output after <think>;
                 # avoid a silent stretch by emitting a tiny marker.
                 yield {"type": "thought", "payload": "Analyzing diagnostics..."}
@@ -1349,6 +1362,12 @@ class RKLLMBackend:
                     next_role = "user"
                     next_content = FORCE_VERDICT_DIRECTIVE
                     # keep_history=1 already set after first turn.
+                    # Turn off thinking for the retry so the entire
+                    # max_new_tokens budget is available for the
+                    # structured <verdict>/<recommendation> output —
+                    # diagnostic context is already in KV cache, no
+                    # need to re-reason.
+                    next_thinking = False
                     history.append({
                         "role": "user",
                         "content": FORCE_VERDICT_DIRECTIVE,

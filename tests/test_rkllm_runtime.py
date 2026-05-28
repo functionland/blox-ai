@@ -626,6 +626,59 @@ def test_run_troubleshoot_force_verdict_directive_works():
     assert any(FORCE_VERDICT_DIRECTIVE in p for p in prompts_seen)
 
 
+def test_force_verdict_retry_runs_with_thinking_off():
+    """Tier 1 verdict-recovery fix: when the model produces prose-only
+    output on turn 0 (no XML, no tool_call), the backend injects the
+    force-verdict directive AND turns thinking off for the retry so the
+    entire max_new_tokens budget lands on the structured <verdict> block
+    instead of the model exhausting it inside another <think>…</think>.
+
+    Verified by recording the enable_thinking flag on each generate()
+    call: turn 0 runs with thinking ON (backend-level enable_thinking
+    flag), turn 1 (the force-verdict retry) runs with thinking OFF."""
+    import asyncio
+    from src.runtime.rkllm_runtime import RKLLMBackend, FORCE_VERDICT_DIRECTIVE
+
+    turn_outputs = [
+        "I am rambling about your question.",  # prose only -> force-verdict
+        '<verdict>{"summary":"green","severity":"green","root_cause":"ok"}</verdict>',
+    ]
+    turn_idx = {"i": 0}
+    thinking_per_turn: list[bool] = []
+
+    class ThinkingCaptureRuntime:
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
+            thinking_per_turn.append(enable_thinking)
+            i = turn_idx["i"]
+            turn_idx["i"] = i + 1
+            return turn_outputs[i] if i < len(turn_outputs) else "(end)"
+
+    # Simulate a Qwen 3 backend where the default IS thinking-on so we
+    # can prove the retry overrides it. Setting _enable_thinking=True
+    # bypasses the filename check.
+    backend = RKLLMBackend(
+        loaded=True,
+        _runtime=ThinkingCaptureRuntime(),
+        _enable_thinking=True,
+    )
+    backend.wire_runtime_deps(tool_executor=None, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("x")]
+
+    events = asyncio.run(collect())
+    # Both turns ran
+    assert len(thinking_per_turn) == 2, thinking_per_turn
+    # Turn 0 used backend's thinking default (True for Qwen 3)
+    assert thinking_per_turn[0] is True, "turn 0 should use backend's thinking default"
+    # Turn 1 (force-verdict retry) MUST run with thinking off so the
+    # full token budget is available for the structured block
+    assert thinking_per_turn[1] is False, "force-verdict retry must run thinking=False"
+    # Sanity: real verdict came through, not the synthetic fallback
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert verdicts[0]["payload"]["root_cause"] == "ok"
+
+
 # ---------------------------------------------------------------------------
 # Qwen 3 thinking-mode swap (2026-05-26)
 # ---------------------------------------------------------------------------

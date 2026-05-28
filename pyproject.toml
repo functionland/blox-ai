@@ -16,6 +16,11 @@ dependencies = [
 dev = [
     "pytest>=8.0,<9",
     "httpx>=0.27,<1",
+    # Phase 0.5a — test_chain.py uses keccak256 to recompute and verify
+    # the pinned FUNCTION_SELECTORS dict. NOT a runtime dep (selectors
+    # are precomputed offline and pasted as static strings); only the
+    # test reproducibility check needs it. pycryptodome is small.
+    "pycryptodome>=3.20,<4",
 ]
 
 [tool.pytest.ini_options]

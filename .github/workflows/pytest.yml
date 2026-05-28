@@ -17,7 +17,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: functionland/fula-ota
-          ref: blox-ai
+          # main holds the canonical schema (companion commits go directly
+          # to main). Prior `ref: blox-ai` pointed at a stale plan branch
+          # that no longer tracks schema updates → schema-dep tests
+          # silently skipped in CI from 2026-05-27 onward.
+          ref: main
           path: fula-ota
         continue-on-error: true
 

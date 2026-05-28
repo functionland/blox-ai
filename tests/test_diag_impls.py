@@ -744,6 +744,430 @@ def test_network_interface_sysfs_wifi_detection_handles_capital_p():
 
 
 # ---------------------------------------------------------------------------
+# diag/uniondrive (Phase 0.5b)
+# ---------------------------------------------------------------------------
+
+_FAKE_MOUNT_OUTPUT = """\
+proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)
+/dev/sda1 on /media/pi/sda1 type ext4 (rw,relatime,errors=remount-ro)
+/media/pi/sda1 on /uniondrive type fuse.mergerfs (rw,nosuid,nodev,relatime,user_id=0,group_id=0,default_permissions,allow_other)
+tmpfs on /run type tmpfs (rw,nosuid,nodev,size=10%,mode=755)
+"""
+
+_FAKE_DF_BYTES_OUTPUT = """\
+Filesystem      1B-blocks         Used    Available Use% Mounted on
+/media/pi/sda1 1006632960000 200000000000 800000000000  20% /uniondrive
+"""
+
+
+def test_uniondrive_happy_path_mounted_with_mergerfs():
+    from src.tools.diag_impls import uniondrive as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which" and cmd[1] == "mergerfs":
+            return 0, "/usr/bin/mergerfs\n", ""
+        if cmd[0] == "mount":
+            return 0, _FAKE_MOUNT_OUTPUT, ""
+        if cmd[0] == "mergerfs" and cmd[1] == "--version":
+            return 0, "mergerfs version: 2.33.5\n", ""
+        if cmd[0] == "df":
+            return 0, _FAKE_DF_BYTES_OUTPUT, ""
+        if cmd[0] == "dmesg":
+            return 0, "[12345] usb 1-1: new high-speed USB device\n", ""
+        return -1, "", ""
+
+    def fake_open(*args, **kwargs):
+        # /sys/fs/ext4/sda1/errors_count → 0
+        from io import StringIO
+        return StringIO("0\n")
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_uniondrive()
+    assert r["mounted"] is True
+    assert r["mergerfs_installed"] is True
+    assert r["mergerfs_version"] == "2.33.5"
+    assert r["mount_source"] == "/media/pi/sda1"
+    assert r["mount_fstype"] == "fuse.mergerfs"
+    assert r["size_bytes"] == 1006632960000
+    assert r["used_bytes"] == 200000000000
+    assert r["avail_bytes"] == 800000000000
+    assert r["use_percent"] == 20
+    assert r["backing_device"] == "sda1"
+    assert r["ext4_errors_count"] == 0
+    assert r["dmesg_io_errors_1h"] == 0
+    _validate(r, "uniondrive")
+
+
+def test_uniondrive_not_mounted():
+    from src.tools.diag_impls import uniondrive as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return 0, "/usr/bin/mergerfs\n", ""
+        if cmd[0] == "mount":
+            # uniondrive not in mount table
+            return 0, "proc on /proc type proc (rw)\n", ""
+        if cmd[0] == "dmesg":
+            return 0, "", ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_uniondrive()
+    assert r["mounted"] is False
+    assert r["mergerfs_installed"] is True
+    # No size/backing fields when not mounted.
+    assert "size_bytes" not in r
+    assert "backing_device" not in r
+    _validate(r, "uniondrive")
+
+
+def test_uniondrive_mergerfs_not_installed():
+    from src.tools.diag_impls import uniondrive as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which" and cmd[1] == "mergerfs":
+            return 1, "", ""   # not found
+        if cmd[0] == "mount":
+            return 0, _FAKE_MOUNT_OUTPUT, ""
+        if cmd[0] == "df":
+            return 0, _FAKE_DF_BYTES_OUTPUT, ""
+        if cmd[0] == "dmesg":
+            return 0, "", ""
+        return -1, "", ""
+
+    def fake_open(*args, **kwargs):
+        from io import StringIO
+        return StringIO("0\n")
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_uniondrive()
+    # Even when mergerfs isn't installed, uniondrive may still be mounted
+    # via a plain bind — we surface the truth of each independently.
+    assert r["mergerfs_installed"] is False
+    assert "mergerfs_version" not in r
+    _validate(r, "uniondrive")
+
+
+def test_uniondrive_dmesg_denied_returns_no_io_count():
+    from src.tools.diag_impls import uniondrive as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return 0, "x", ""
+        if cmd[0] == "mount":
+            return 0, _FAKE_MOUNT_OUTPUT, ""
+        if cmd[0] == "df":
+            return 0, _FAKE_DF_BYTES_OUTPUT, ""
+        if cmd[0] == "dmesg":
+            return -1, "", "permission denied"
+        return -1, "", ""
+
+    def fake_open(*args, **kwargs):
+        from io import StringIO
+        return StringIO("0\n")
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_uniondrive()
+    # dmesg denied → field absent rather than misleading 0
+    assert "dmesg_io_errors_1h" not in r
+    _validate(r, "uniondrive")
+
+
+def test_uniondrive_dmesg_counts_io_errors():
+    from src.tools.diag_impls import uniondrive as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return 0, "x", ""
+        if cmd[0] == "mount":
+            return 0, _FAKE_MOUNT_OUTPUT, ""
+        if cmd[0] == "df":
+            return 0, _FAKE_DF_BYTES_OUTPUT, ""
+        if cmd[0] == "dmesg":
+            return 0, (
+                "[12000] sd 0:0:0:0: I/O error, dev sda1, sector 12345\n"
+                "[12001] normal: filesystem syncing\n"
+                "[12002] sd 0:0:0:0: I/O error, dev sda1, sector 67890\n"
+            ), ""
+        return -1, "", ""
+
+    def fake_open(*args, **kwargs):
+        from io import StringIO
+        return StringIO("0\n")
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_uniondrive()
+    assert r["dmesg_io_errors_1h"] == 2
+    _validate(r, "uniondrive")
+
+
+# ---------------------------------------------------------------------------
+# diag/identity_health (Phase 0.5b — chain-grounded)
+# ---------------------------------------------------------------------------
+
+# Real ipfs-cluster peerID from the lab device (locks the chain
+# encoding against accidental regressions; pre-image known from
+# /uniondrive/ipfs-cluster/identity.json).
+_LAB_CLUSTER_PEER = "12D3KooWE6gC66XWxKacdna5LX4ymwnCCMpaddBFkB8At3WedRaZ"
+
+_FAKE_CONFIG_YAML = """\
+identity: CAESQOv383qnlddAENR91qxb/SQfydhCcm5wzUe0uxBf6CzQP5xrZbfxslkZOQ67OSBHBjsPasfIojRZpP8CCoHFCgo=
+storeDir: /uniondrive
+poolName: "1"
+chainName: skale
+logLevel: info
+listenAddrs:
+    - /ip4/0.0.0.0/tcp/40001
+authorizer: 12D3KooWMyqtPp57DY46FrHheoRPS6PyQvnV2azspWKpgpyde6zg
+"""
+
+
+def _fake_identity_json():
+    return json.dumps({"id": _LAB_CLUSTER_PEER, "private_key": "REDACTED"})
+
+
+def _bool_addr_hex(is_true: bool, addr_hex: str = "00" * 20) -> str:
+    """Encode (bool, address) ABI tuple as a 0x-prefixed 128-hex string."""
+    bool_word = "00" * 31 + ("01" if is_true else "00")
+    addr_word = "00" * 12 + addr_hex
+    return "0x" + bool_word + addr_word
+
+
+def _uint_pair_hex(a: int, b: int) -> str:
+    return "0x" + f"{a:064x}" + f"{b:064x}"
+
+
+def test_identity_health_happy_path_member_and_online():
+    from src.tools.diag_impls import identity_health as mod
+    from src.tools.chain import CallResult, clear_cache_for_tests
+    clear_cache_for_tests()
+
+    call_results = [
+        # 1st call: isPeerIdMemberOfPool → (true, deadbeef..)
+        CallResult(state="ok", value=_bool_addr_hex(True, "deadbeefcafebabe1234567890abcdef12345678")),
+        # 2nd call: getOnlineStatusSince → (24, 24)
+        CallResult(state="ok", value=_uint_pair_hex(24, 24)),
+    ]
+    eth_calls_made = []
+
+    def fake_eth_call(chain, addr, data, **kw):
+        eth_calls_made.append((chain, addr, data))
+        return call_results.pop(0)
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO(_FAKE_CONFIG_YAML)
+        if path == mod.CLUSTER_IDENTITY_PATH:
+            return StringIO(_fake_identity_json())
+        raise FileNotFoundError(path)
+
+    with patch.object(mod, "eth_call", side_effect=fake_eth_call), \
+         patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is True
+    assert r["pool_member_reason"] == "ok"
+    assert r["online_recent"] is True
+    assert r["online_recent_reason"] == "ok"
+    assert r["pool_id"] == 1
+    assert r["chain"] == "skale"
+    assert r["cluster_peer_id"] == _LAB_CLUSTER_PEER
+    assert r["cluster_peer_id_bytes32"].startswith("0x")
+    assert len(r["cluster_peer_id_bytes32"]) == 66
+    assert r["online_count"] == 24
+    assert r["online_total_expected"] == 24
+    assert r["pool_member_address"] == "0xdeadbeefcafebabe1234567890abcdef12345678"
+    # The two eth_calls hit the expected contract addresses.
+    assert len(eth_calls_made) == 2
+    pool_storage_call = eth_calls_made[0]
+    reward_engine_call = eth_calls_made[1]
+    assert pool_storage_call[0] == "skale"
+    assert reward_engine_call[0] == "skale"
+    _validate(r, "identity_health")
+
+
+def test_identity_health_not_a_member_and_no_online():
+    from src.tools.diag_impls import identity_health as mod
+    from src.tools.chain import CallResult, clear_cache_for_tests
+    clear_cache_for_tests()
+
+    call_results = [
+        CallResult(state="ok", value=_bool_addr_hex(False)),
+        CallResult(state="ok", value=_uint_pair_hex(0, 24)),
+    ]
+
+    def fake_eth_call(chain, addr, data, **kw):
+        return call_results.pop(0)
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO(_FAKE_CONFIG_YAML)
+        if path == mod.CLUSTER_IDENTITY_PATH:
+            return StringIO(_fake_identity_json())
+        raise FileNotFoundError(path)
+
+    with patch.object(mod, "eth_call", side_effect=fake_eth_call), \
+         patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is False
+    assert r["pool_member_reason"] == "ok"
+    assert r["online_recent"] is False
+    assert r["online_recent_reason"] == "ok"
+    assert r["online_count"] == 0
+    assert r["online_total_expected"] == 24
+    # No pool_member_address when not a member (zero-address sentinel)
+    assert "pool_member_address" not in r
+    _validate(r, "identity_health")
+
+
+def test_identity_health_rpc_unreachable_marks_both_unknown():
+    from src.tools.diag_impls import identity_health as mod
+    from src.tools.chain import CallResult, clear_cache_for_tests
+    clear_cache_for_tests()
+
+    def fake_eth_call(chain, addr, data, **kw):
+        return CallResult(state="unknown", reason="rpc_unreachable")
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO(_FAKE_CONFIG_YAML)
+        if path == mod.CLUSTER_IDENTITY_PATH:
+            return StringIO(_fake_identity_json())
+        raise FileNotFoundError(path)
+
+    with patch.object(mod, "eth_call", side_effect=fake_eth_call), \
+         patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is None
+    assert r["pool_member_reason"] == "rpc_unreachable"
+    assert r["online_recent"] is None
+    assert r["online_recent_reason"] == "rpc_unreachable"
+    # Identity fields are still populated — trees can still surface them
+    assert r["cluster_peer_id"] == _LAB_CLUSTER_PEER
+    assert r["pool_id"] == 1
+    _validate(r, "identity_health")
+
+
+def test_identity_health_chain_revert_marks_error():
+    from src.tools.diag_impls import identity_health as mod
+    from src.tools.chain import CallResult, clear_cache_for_tests
+    clear_cache_for_tests()
+
+    def fake_eth_call(chain, addr, data, **kw):
+        return CallResult(state="error", reason="execution reverted")
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO(_FAKE_CONFIG_YAML)
+        if path == mod.CLUSTER_IDENTITY_PATH:
+            return StringIO(_fake_identity_json())
+        raise FileNotFoundError(path)
+
+    with patch.object(mod, "eth_call", side_effect=fake_eth_call), \
+         patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is None
+    assert "chain_error" in r["pool_member_reason"]
+    assert r["online_recent"] is None
+    assert "chain_error" in r["online_recent_reason"]
+    _validate(r, "identity_health")
+
+
+def test_identity_health_missing_pool_id_short_circuits():
+    from src.tools.diag_impls import identity_health as mod
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO("chainName: skale\nstoreDir: /uniondrive\n")
+        if path == mod.CLUSTER_IDENTITY_PATH:
+            return StringIO(_fake_identity_json())
+        raise FileNotFoundError(path)
+
+    with patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is None
+    assert r["pool_member_reason"] == "missing_pool_id"
+    assert "pool_id" not in r
+    _validate(r, "identity_health")
+
+
+def test_identity_health_unknown_chain_short_circuits():
+    from src.tools.diag_impls import identity_health as mod
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO('poolName: "1"\nchainName: dogechain\n')
+        if path == mod.CLUSTER_IDENTITY_PATH:
+            return StringIO(_fake_identity_json())
+        raise FileNotFoundError(path)
+
+    with patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is None
+    assert "unknown_chain:dogechain" in r["pool_member_reason"]
+    _validate(r, "identity_health")
+
+
+def test_identity_health_missing_cluster_identity():
+    from src.tools.diag_impls import identity_health as mod
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO(_FAKE_CONFIG_YAML)
+        raise FileNotFoundError(path)
+
+    with patch("builtins.open", side_effect=fake_open_router):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is None
+    assert r["pool_member_reason"] == "missing_cluster_peer_id"
+    assert "cluster_peer_id" not in r
+    _validate(r, "identity_health")
+
+
+def test_identity_health_config_yaml_parser_handles_quoted_and_unquoted():
+    from src.tools.diag_impls.identity_health import _read_config_yaml
+
+    def open_with(text):
+        from unittest.mock import mock_open
+        return mock_open(read_data=text)
+
+    # Quoted poolName
+    with patch("builtins.open", open_with('poolName: "42"\nchainName: base\n')):
+        c = _read_config_yaml("/fake")
+    assert c["poolName_int"] == 42
+    assert c["chainName"] == "base"
+
+    # Unquoted poolName (also valid YAML — sometimes seen)
+    with patch("builtins.open", open_with("poolName: 7\nchainName: skale\n")):
+        c = _read_config_yaml("/fake")
+    assert c["poolName_int"] == 7
+
+    # Empty file → empty dict (graceful)
+    with patch("builtins.open", open_with("")):
+        c = _read_config_yaml("/fake")
+    assert c == {}
+
+    # Nested list items must be ignored (we only want top-level scalars)
+    with patch("builtins.open", open_with(
+        'poolName: "1"\nchainName: skale\nlistenAddrs:\n    - /ip4/0.0.0.0/tcp/40001\nauthorizer: 12D3Koo\n'
+    )):
+        c = _read_config_yaml("/fake")
+    assert c["poolName_int"] == 1
+    assert c["chainName"] == "skale"
+    assert c["authorizer"] == "12D3Koo"
+
+
+# ---------------------------------------------------------------------------
 # diag/summary
 # ---------------------------------------------------------------------------
 
@@ -823,6 +1247,8 @@ _EXPECTED_TOOL_SET = {
     "diag/heartbeat", "diag/events", "diag/readiness", "diag/summary",
     # Phase 0.5a additions (deterministic-tree foundation, schema v2)
     "diag/discovery_state", "diag/systemd_services", "diag/network_interface",
+    # Phase 0.5b additions (uniondrive + identity_health, schema v3)
+    "diag/uniondrive", "diag/identity_health",
 }
 
 

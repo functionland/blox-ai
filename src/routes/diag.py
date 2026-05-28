@@ -23,6 +23,7 @@ ToolName = Literal[
     "internet", "relay", "time", "power", "storage", "containers",
     "wireguard", "heartbeat", "events", "readiness", "summary",
     "discovery_state", "systemd_services", "network_interface",
+    "uniondrive", "identity_health",
 ]
 
 

@@ -81,6 +81,23 @@ _CANNED: dict[str, dict] = {
         ],
         "tools_present": {"ip": True, "iw": True},
     },
+    "diag/uniondrive": {
+        "mounted": True, "mergerfs_installed": True,
+        "mergerfs_version": "2.33.5",
+        "mount_source": "/media/pi/sda1", "mount_fstype": "fuse.mergerfs",
+        "size_bytes": 1_000_000_000_000, "used_bytes": 200_000_000_000,
+        "avail_bytes": 800_000_000_000, "use_percent": 20,
+        "backing_device": "sda1", "ext4_errors_count": 0,
+        "dmesg_io_errors_1h": 0,
+    },
+    "diag/identity_health": {
+        "pool_member": True, "pool_member_reason": "ok",
+        "online_recent": True, "online_recent_reason": "ok",
+        "pool_id": 1, "chain": "skale",
+        "cluster_peer_id": "12D3KooWE6gC66XWxKacdna5LX4ymwnCCMpaddBFkB8At3WedRaZ",
+        "online_count": 24, "online_total_expected": 24,
+        "online_window_s": 86400,
+    },
 }
 
 

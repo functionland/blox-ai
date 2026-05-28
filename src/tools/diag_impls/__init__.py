@@ -15,6 +15,7 @@ from src.tools.diag_impls.containers import diag_containers
 from src.tools.diag_impls.discovery_state import diag_discovery_state
 from src.tools.diag_impls.events import diag_events
 from src.tools.diag_impls.heartbeat import diag_heartbeat
+from src.tools.diag_impls.identity_health import diag_identity_health
 from src.tools.diag_impls.internet import diag_internet
 from src.tools.diag_impls.network_interface import diag_network_interface
 from src.tools.diag_impls.power import diag_power
@@ -24,6 +25,7 @@ from src.tools.diag_impls.storage import diag_storage
 from src.tools.diag_impls.summary import diag_summary
 from src.tools.diag_impls.systemd_services import diag_systemd_services
 from src.tools.diag_impls.time_ import diag_time
+from src.tools.diag_impls.uniondrive import diag_uniondrive
 from src.tools.diag_impls.wireguard import diag_wireguard
 
 
@@ -49,6 +51,8 @@ _DISPATCH: dict[str, Callable[[], dict]] = {
     "diag/discovery_state":    diag_discovery_state,
     "diag/systemd_services":   diag_systemd_services,
     "diag/network_interface":  diag_network_interface,
+    "diag/uniondrive":         diag_uniondrive,
+    "diag/identity_health":    diag_identity_health,
 }
 
 

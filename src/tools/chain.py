@@ -26,13 +26,21 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from src.tools.diag_impls._helpers import http_post_json
+# NOTE: chain.py is intentionally self-contained — it does NOT import
+# from src.tools.diag_impls because Phase 0.5b added
+# diag_impls/identity_health.py which imports from this module, so
+# importing diag_impls helpers at module-load time creates a circular
+# dep. http_post_json is duplicated here (~10 LoC); we keep the
+# diag_impls/_helpers.py copy as-is for callers that already use it.
 
 
 logger = logging.getLogger("blox-ai.chain")
@@ -291,7 +299,75 @@ def decode_bool(hex_value: str) -> bool:
     return any(c != "0" for c in s)
 
 
+def decode_bool_and_address(hex_value: str) -> tuple[bool, str]:
+    """Decode `(bool, address)` ABI tuple return — two 32-byte words.
+    Used for isPeerIdMemberOfPool which returns (bool isMember, address
+    memberAddress).
+
+    Layout (per Solidity ABI):
+      [0..32)  bool  — low byte; 0x00..00 == False, anything else == True
+      [32..64) address — low 20 bytes; high 12 bytes are zero padding
+
+    Returns the address as a 0x-prefixed 40-hex-char lowercase string
+    (matches eth checksum-stripped form). Raises ValueError on
+    malformed input.
+    """
+    s = hex_value[2:] if hex_value.startswith("0x") else hex_value
+    if len(s) != 128:
+        raise ValueError(
+            f"expected (bool,address) tuple = 64 bytes hex; got len={len(s)}"
+        )
+    bool_word = s[:64]
+    addr_word = s[64:128]
+    is_true = any(c != "0" for c in bool_word)
+    # Address occupies the LOW 20 bytes (last 40 hex chars) of the word.
+    # High 12 bytes (first 24 hex chars) are zero padding.
+    address = "0x" + addr_word[-40:].lower()
+    return is_true, address
+
+
+def decode_uint256_pair(hex_value: str) -> tuple[int, int]:
+    """Decode `(uint256, uint256)` ABI tuple — two 32-byte big-endian ints.
+    Used for getOnlineStatusSince which returns (uint256 onlineCount,
+    uint256 totalExpected)."""
+    s = hex_value[2:] if hex_value.startswith("0x") else hex_value
+    if len(s) != 128:
+        raise ValueError(
+            f"expected (uint256,uint256) tuple = 64 bytes hex; got len={len(s)}"
+        )
+    a = int(s[:64], 16)
+    b = int(s[64:128], 16)
+    return a, b
+
+
 def clear_cache_for_tests() -> None:
     """Test-only: reset the call cache so cases don't leak across runs."""
     with _call_cache_lock:
         _call_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Inlined http helper (avoid circular import with diag_impls)
+# ---------------------------------------------------------------------------
+
+
+def http_post_json(url: str, body: dict, timeout_s: float = 5.0) -> Any:
+    """POST JSON body, parse JSON response. Returns None on any error.
+
+    Duplicated from src.tools.diag_impls._helpers because chain.py must
+    not import diag_impls (Phase 0.5b's identity_health imports back
+    from chain.py, creating a circular dep at module-load time).
+    Keeping the helper inline costs ~12 LoC and keeps chain.py
+    self-contained."""
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            OSError, json.JSONDecodeError, TimeoutError):
+        return None

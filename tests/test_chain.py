@@ -23,6 +23,8 @@ from src.tools.chain import (
     _b58_decode,
     clear_cache_for_tests,
     decode_bool,
+    decode_bool_and_address,
+    decode_uint256_pair,
     encode_bytes32,
     encode_call,
     encode_uint32,
@@ -309,3 +311,66 @@ class TestDecodeBool:
 
     def test_any_nonzero_is_true(self):
         assert decode_bool("0x" + "ff" * 32) is True
+
+
+class TestDecodeBoolAndAddress:
+    """isPeerIdMemberOfPool returns (bool isMember, address memberAddress).
+    Tests pin the layout so an ABI shape change cannot silently slip in."""
+
+    def test_false_with_zero_address(self):
+        # Common case: peer is NOT a member; both words zero.
+        hex_value = "0x" + "00" * 64
+        is_member, addr = decode_bool_and_address(hex_value)
+        assert is_member is False
+        assert addr == "0x" + "0" * 40
+
+    def test_true_with_real_address(self):
+        # bool=1; address packed in low 20 bytes of second word.
+        addr_hex = "deadbeefcafebabe1234567890abcdef12345678"
+        assert len(addr_hex) == 40
+        hex_value = "0x" + "00" * 31 + "01" + "00" * 12 + addr_hex
+        is_member, addr = decode_bool_and_address(hex_value)
+        assert is_member is True
+        assert addr == "0x" + addr_hex.lower()
+
+    def test_rejects_short_input(self):
+        with pytest.raises(ValueError):
+            decode_bool_and_address("0x" + "00" * 32)   # only 1 word
+
+    def test_rejects_long_input(self):
+        with pytest.raises(ValueError):
+            decode_bool_and_address("0x" + "00" * 96)   # 3 words
+
+    def test_accepts_no_0x_prefix(self):
+        hex_value = "00" * 64
+        is_member, addr = decode_bool_and_address(hex_value)
+        assert is_member is False
+        assert addr == "0x" + "0" * 40
+
+    def test_address_is_lowercased(self):
+        # Verify we lowercase even if the input mixes case (chain RPCs
+        # typically return lowercase, but be defensive).
+        hex_value = "0x" + "00" * 31 + "01" + "00" * 12 + "ABCDEF1234567890ABCDEF1234567890ABCDEF12"
+        _, addr = decode_bool_and_address(hex_value)
+        assert addr == "0xabcdef1234567890abcdef1234567890abcdef12"
+
+
+class TestDecodeUint256Pair:
+    """getOnlineStatusSince returns (uint256 onlineCount, uint256 totalExpected)."""
+
+    def test_zero_zero(self):
+        assert decode_uint256_pair("0x" + "00" * 64) == (0, 0)
+
+    def test_packed_values(self):
+        # onlineCount=5, totalExpected=10
+        hex_value = "0x" + ("00" * 31 + "05") + ("00" * 31 + "0a")
+        assert decode_uint256_pair(hex_value) == (5, 10)
+
+    def test_max_values(self):
+        max_v = (1 << 256) - 1
+        hex_value = "0x" + ("ff" * 32) + ("ff" * 32)
+        assert decode_uint256_pair(hex_value) == (max_v, max_v)
+
+    def test_rejects_wrong_length(self):
+        with pytest.raises(ValueError):
+            decode_uint256_pair("0x" + "00" * 32)

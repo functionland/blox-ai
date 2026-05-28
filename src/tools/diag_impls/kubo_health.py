@@ -12,10 +12,20 @@ kubo HTTP API uses POST for everything per the docs. No GET fallback.
 """
 from __future__ import annotations
 
+import os
+
 from src.tools.diag_impls._helpers import http_post_json
 
 
-KUBO_API = "http://127.0.0.1:5001/api/v0"
+# Default kubo API base. When run inside the blox-ai container on the
+# fula_default network, `ipfs_host:5001` resolves to the kubo container.
+# When run on the host directly (smoke scripts), kubo binds to
+# 127.0.0.1:5001 per fula docker-compose port mapping — override:
+#   BLOX_AI_KUBO_API_URL=http://127.0.0.1:5001/api/v0
+KUBO_API = os.environ.get(
+    "BLOX_AI_KUBO_API_URL",
+    "http://ipfs_host:5001/api/v0",
+)
 _TIMEOUT_S = 3.0
 
 

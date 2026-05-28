@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -48,9 +49,25 @@ from src.tools.chain import (
 logger = logging.getLogger("blox-ai.diag.identity_health")
 
 
-# Defaults — tunable later if we move to per-call config.
-CONFIG_YAML_PATH = "/home/pi/.internal/config.yaml"
-CLUSTER_IDENTITY_PATH = "/uniondrive/ipfs-cluster/identity.json"
+# Path defaults — env-overridable so the container (which mounts the
+# host paths at different locations per docker-compose volumes) and
+# direct-host tests can both work without code edits.
+#
+# Container-side default: docker-compose.yml mounts:
+#   /home/pi/.internal/config.yaml          → /etc/fula/host-config.yaml
+#   /uniondrive/ipfs-cluster/identity.json  → /etc/fula/host-ipfs-cluster-identity.json
+#
+# Host-side override (smoke tests run on the host directly): set
+#   BLOX_AI_CONFIG_YAML_PATH=/home/pi/.internal/config.yaml
+#   BLOX_AI_CLUSTER_IDENTITY_PATH=/uniondrive/ipfs-cluster/identity.json
+CONFIG_YAML_PATH = os.environ.get(
+    "BLOX_AI_CONFIG_YAML_PATH",
+    "/etc/fula/host-config.yaml",
+)
+CLUSTER_IDENTITY_PATH = os.environ.get(
+    "BLOX_AI_CLUSTER_IDENTITY_PATH",
+    "/etc/fula/host-ipfs-cluster-identity.json",
+)
 
 # "Recent" window for getOnlineStatusSince. The on-chain ledger expects
 # online-status submissions roughly hourly; 24h gives 24 expected

@@ -1420,11 +1420,13 @@ def test_ble_state_missing_returns_null():
 
 def test_plugins_with_active_blox_ai():
     from src.tools.diag_impls import plugins as mod
-
+    import os
+    # Resolve paths through the module-level constants so the test
+    # passes regardless of which env-overridable default is active.
     fake_files = {
-        "/home/pi/.internal/plugins/active-plugins.txt": "blox-ai\n",
-        "/home/pi/.internal/plugins/blox-ai/status.txt": "Installed\n",
-        "/usr/bin/fula/plugins/blox-ai/info.json": json.dumps({
+        mod.ACTIVE_PLUGINS_PATH: "blox-ai\n",
+        os.path.join(mod.RUNTIME_PLUGINS_DIR, "blox-ai", "status.txt"): "Installed\n",
+        os.path.join(mod.SOURCE_PLUGINS_DIR, "blox-ai", "info.json"): json.dumps({
             "name": "blox-ai", "display_name": "Blox AI",
             "version": "202", "description": "On-device AI assistant.",
         }),
@@ -1478,11 +1480,11 @@ def test_plugins_no_active_plugins():
 def test_plugins_installed_but_not_active():
     """Plugin install in progress, manager hasn't picked it up yet."""
     from src.tools.diag_impls import plugins as mod
-
+    import os
     fake_files = {
-        "/home/pi/.internal/plugins/active-plugins.txt": "",
-        "/home/pi/.internal/plugins/blox-ai/status.txt": "Installing\n",
-        "/usr/bin/fula/plugins/blox-ai/info.json": '{"version":"202"}',
+        mod.ACTIVE_PLUGINS_PATH: "",
+        os.path.join(mod.RUNTIME_PLUGINS_DIR, "blox-ai", "status.txt"): "Installing\n",
+        os.path.join(mod.SOURCE_PLUGINS_DIR, "blox-ai", "info.json"): '{"version":"202"}',
     }
 
     def fake_open(path, *args, **kwargs):

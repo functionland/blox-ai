@@ -18,13 +18,29 @@ Trees branch on:
 from __future__ import annotations
 
 import json
+import os
 
 from src.tools.diag_impls._helpers import read_state, run_subprocess
 
 
-ACTIVE_PLUGINS_PATH = "/home/pi/.internal/plugins/active-plugins.txt"
-RUNTIME_PLUGINS_DIR = "/home/pi/.internal/plugins"
-SOURCE_PLUGINS_DIR = "/usr/bin/fula/plugins"
+# Container-side default: docker-compose.yml mounts
+#   /home/pi/.internal/plugins → /etc/fula/host-plugins
+# Host-side override (smoke tests): set BLOX_AI_PLUGINS_DIR=/home/pi/.internal/plugins
+RUNTIME_PLUGINS_DIR = os.environ.get(
+    "BLOX_AI_PLUGINS_DIR",
+    "/etc/fula/host-plugins",
+)
+ACTIVE_PLUGINS_PATH = os.environ.get(
+    "BLOX_AI_ACTIVE_PLUGINS_PATH",
+    f"{RUNTIME_PLUGINS_DIR}/active-plugins.txt",
+)
+# SOURCE dir holds info.json per plugin — typically /usr/bin/fula/plugins/<name>.
+# Not mounted into the container by default; trees fall back to runtime-only
+# data when info.json is unavailable.
+SOURCE_PLUGINS_DIR = os.environ.get(
+    "BLOX_AI_SOURCE_PLUGINS_DIR",
+    "/usr/bin/fula/plugins",
+)
 _TIMEOUT_S = 2.0
 
 
@@ -67,7 +83,7 @@ def _read_active_plugins() -> list[str]:
 
 
 def _read_plugin_status(name: str) -> str:
-    path = f"{RUNTIME_PLUGINS_DIR}/{name}/status.txt"
+    path = os.path.join(RUNTIME_PLUGINS_DIR, name, "status.txt")
     try:
         with open(path, encoding="utf-8") as f:
             return f.read().strip()[:64] or "unknown"
@@ -79,7 +95,7 @@ def _read_plugin_info(name: str) -> dict:
     """Read info.json from the SOURCE plugins dir (where the OTA-shipped
     metadata lives), since runtime dirs may not include it. Returns
     {} when not found — tree handles."""
-    path = f"{SOURCE_PLUGINS_DIR}/{name}/info.json"
+    path = os.path.join(SOURCE_PLUGINS_DIR, name, "info.json")
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)

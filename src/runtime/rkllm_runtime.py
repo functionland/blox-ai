@@ -604,28 +604,6 @@ The three allowed blocks:
      - `fula.service`, `uniondrive.service` — host systemd services
      If `diag/containers` returns the above names, that is the COMPLETE list — there is no kubelet, no kube-proxy, no etcd, no apiserver. If the user reports "not earning", look at the actual diag/heartbeat + diag/relay + diag/wireguard signals you see in tool results, NOT at hypothetical Kubernetes components.
 
-# BAD vs GOOD examples
-
-❌ BAD — prose recommendations get NO Approve button, user can take no action:
-
-  ### Tier 2 Actions:
-  1. **ntp.resync** - Resync the clock.
-  2. **docker.restart container=ipfs_host** - Restart the container.
-
-✅ GOOD — each recommendation is its own XML block:
-
-  <recommendation>{{"action_name":"ntp.resync","args":{{}},"reasoning":"Clock is unsynced.","confidence":0.85,"tier":2}}</recommendation>
-  <recommendation>{{"action_name":"docker.restart","args":{{"container":"ipfs_host"}},"reasoning":"ipfs_host restart-looping.","confidence":0.75,"tier":2}}</recommendation>
-
-❌ BAD — making up a field:
-
-  "Time Status: Clock offset is significant (93 ms)"
-  (when tool_response actually said `time.status: green, synced: true` and the 93 was `internet.latency_ms_avg`)
-
-✅ GOOD — quote what you actually read:
-
-  "time.status is green (synced=true). internet.latency_ms_avg is 93ms — that's network latency, not a clock offset."
-
 # AVAILABLE TOOLS (read-only)
 
 {tool_list}
@@ -639,26 +617,27 @@ The three allowed blocks:
 - restart_fula — no args (tier 2)
 - reset — no args (tier 3, destructive — only after everything else)
 
-# FULL EXAMPLE — three-turn flow
-
-Turn 1 (user said "device feels slow"):
-I'll start with a system summary.
-<tool_call>{{"name":"diag/summary","arguments":{{}}}}</tool_call>
-
-Turn 2 (after <tool_response> showing overall=red, internet=red, time=red):
-Internet and time are both red. Drilling in on internet.
-<tool_call>{{"name":"diag/internet","arguments":{{}}}}</tool_call>
-
-Turn 3 (after <tool_response> showing dns_ok=true, https_discovery_ok=false):
-Discovery is unreachable; the clock being unsynced makes it worse. Re-sync NTP first.
-<verdict>{{"summary":"Discovery unreachable + clock unsynced.","severity":"red","root_cause":"discovery_https_unreachable"}}</verdict>
-<recommendation>{{"action_name":"ntp.resync","args":{{}},"reasoning":"Many discovery checks rely on accurate timestamps; resync first.","confidence":0.8,"tier":2}}</recommendation>
-
 # RUNBOOK EXCERPTS
 
 {runbook_excerpt}
 
-Be terse. Start with diag/summary unless the user named a specific symptom. Two or three tool calls, then finalize with a <verdict>."""
+# FIRST ACTION
+
+Your VERY FIRST output token MUST start a <tool_call> block. Do NOT
+repeat these instructions back. Do NOT acknowledge. Do NOT explain
+what you are about to do. Start with `<tool_call>{{"name":"diag/`.
+
+# VERDICT RULES
+
+After tool calls, emit ONE <verdict> with ALL of summary, severity,
+AND root_cause. NEVER omit root_cause. NEVER restate an example
+verdict from your training — base every verdict on the actual
+<tool_response> data you saw in THIS conversation.
+
+If your tool calls all returned `ok:false` or no diagnostic data,
+your verdict MUST be:
+  <verdict>{{"summary":"Could not gather diagnostic data; please try again.","severity":"yellow","root_cause":"insufficient_data"}}</verdict>
+"""
 
 
 # Directive injected as a user message when the model has stalled
@@ -856,12 +835,22 @@ def parse_verdict(raw_text: str) -> Optional[dict]:
         return None
     summary = obj.get("summary")
     severity = obj.get("severity")
+    root_cause = obj.get("root_cause")
     if not isinstance(summary, str) or severity not in ("green", "yellow", "red"):
         return None
-    out = {"summary": summary[:500], "severity": severity}
-    if isinstance(obj.get("root_cause"), str):
-        out["root_cause"] = obj["root_cause"][:200]
-    return out
+    # root_cause is now REQUIRED — lab 2026-05-28: Qwen3-1.7B was emitting
+    # verdicts without root_cause, the SSE schema accepted them (root_cause
+    # was schema-optional), and the app's synthetic-verdict detector
+    # therefore never offered the Try-Again button. Rejecting here forces
+    # the run_troubleshoot loop into its no-verdict fallback path which
+    # synthesizes a proper verdict with a root_cause the app can detect.
+    if not isinstance(root_cause, str) or not root_cause.strip():
+        return None
+    return {
+        "summary": summary[:500],
+        "severity": severity,
+        "root_cause": root_cause[:200],
+    }
 
 
 def parse_recommendations(raw_text: str) -> list[dict]:
@@ -1150,6 +1139,16 @@ class RKLLMBackend:
         # fallback). Diagnostic data is already in KV cache from prior
         # turns, so the retry only needs to format the conclusion.
         next_thinking: bool = self._enable_thinking
+        # successful_tool_count: incremented per tool_result with ok=True
+        # AND payload not None. Used by the no-data guardrail below the
+        # tool-call loop to suppress speculative verdicts (lab transcript
+        # 2026-05-28 not-earning scenario: model emitted
+        # "Internet slow + clock unsynced" verdict despite both tool
+        # calls returning ok=False payload=None — pattern-copied the
+        # GOOD example from the system prompt). Zero successful tools
+        # means we have no actual evidence for any severity-red claim;
+        # override with insufficient_data.
+        successful_tool_count: int = 0
 
         for turn in range(MAX_TURNS):
             # Last-chance: at MAX_TURNS-1 without a verdict, send the
@@ -1276,6 +1275,13 @@ class RKLLMBackend:
                         tool_responses_for_context.append(
                             f"<tool_response>{json.dumps({'name': tc['tool'], 'result': result}, separators=(',', ':'))}</tool_response>"
                         )
+                        # Track successful evidence count for the no-data
+                        # verdict guardrail (see successful_tool_count
+                        # initialization comment + the guardrail block
+                        # before the `if verdict and not emitted_verdict`
+                        # yield below).
+                        if result is not None:
+                            successful_tool_count += 1
                     else:
                         tr_event = {
                             "type": "tool_result",
@@ -1308,6 +1314,37 @@ class RKLLMBackend:
                     "role": "tool",
                     "content": next_content,
                 })
+
+            # No-evidence guardrail: if the model produced a verdict
+            # but NO tool call has ever returned actual data (all ok=False
+            # or all payload=None), suppress the speculative claim and
+            # replace with insufficient_data. Lab 2026-05-28: the
+            # not-earning scenario hit exactly this — model emitted
+            # `severity:red, summary:"Internet slow + clock unsynced"`
+            # while both tool_results in the transcript had payload:null
+            # (ok=False). Without this guardrail the user gets a
+            # confident-but-fabricated diagnosis. The override leaves the
+            # door open for the Try-Again button via the
+            # `insufficient_data` root_cause (apps/box's
+            # SYNTHETIC_VERDICT_CODES). Skip the override when the model
+            # ALREADY chose insufficient_data — that's the honest case.
+            if (
+                verdict
+                and not emitted_verdict
+                and successful_tool_count == 0
+                and verdict.get("root_cause") != "insufficient_data"
+            ):
+                logger.warning(
+                    "verdict_no_evidence_override original_severity=%s original_root_cause=%s",
+                    verdict.get("severity"),
+                    verdict.get("root_cause"),
+                )
+                verdict = {
+                    "summary": "Could not gather diagnostic data; please try again.",
+                    "severity": "yellow",
+                    "root_cause": "insufficient_data",
+                }
+                recommendations = []  # never propose actions without evidence
 
             # Emit verdict (once)
             if verdict and not emitted_verdict:

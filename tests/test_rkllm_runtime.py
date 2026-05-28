@@ -259,13 +259,32 @@ def test_parse_verdict_happy_path():
 
 def test_parse_verdict_rejects_invalid_severity():
     from src.runtime.rkllm_runtime import parse_verdict
-    text = '<verdict>{"summary": "x", "severity": "purple"}</verdict>'
+    text = '<verdict>{"summary": "x", "severity": "purple", "root_cause": "x"}</verdict>'
     assert parse_verdict(text) is None
 
 
 def test_parse_verdict_rejects_missing_summary():
     from src.runtime.rkllm_runtime import parse_verdict
-    text = '<verdict>{"severity": "green"}</verdict>'
+    text = '<verdict>{"severity": "green", "root_cause": "x"}</verdict>'
+    assert parse_verdict(text) is None
+
+
+def test_parse_verdict_rejects_missing_root_cause():
+    """Lab 2026-05-28 not-earning transcript: model emitted a verdict
+    with only summary+severity, no root_cause. The SSE schema accepted
+    it (root_cause is optional in the schema), but the app's synthetic-
+    verdict detector keys on root_cause so the user got no Try-Again
+    button. Parser now rejects so the run_troubleshoot loop falls into
+    its no-verdict path and synthesizes a verdict with a real
+    root_cause that the app can detect."""
+    from src.runtime.rkllm_runtime import parse_verdict
+    text = '<verdict>{"summary": "Internet slow + clock unsynced.", "severity": "red"}</verdict>'
+    assert parse_verdict(text) is None
+
+
+def test_parse_verdict_rejects_empty_root_cause():
+    from src.runtime.rkllm_runtime import parse_verdict
+    text = '<verdict>{"summary": "x", "severity": "green", "root_cause": "   "}</verdict>'
     assert parse_verdict(text) is None
 
 
@@ -593,11 +612,21 @@ def test_run_troubleshoot_force_verdict_directive_works():
     """When the model emits prose on turn 0 but produces a verdict on
     turn 1 (after the force-verdict directive is injected), the
     backend yields the REAL model verdict — NOT the synthetic
-    fallback. Verifies the force-verdict path."""
+    fallback. Verifies the force-verdict path.
+
+    Turn 0 includes a successful diag/summary call so the no-evidence
+    guardrail doesn't (correctly) override the model's verdict — the
+    fixture's intent is to test the force-verdict directive, not the
+    guardrail. See test_no_evidence_guardrail_overrides_speculative_verdict
+    for the zero-tool case."""
     import asyncio
     from src.runtime.rkllm_runtime import RKLLMBackend, FORCE_VERDICT_DIRECTIVE
 
     turn_outputs = [
+        # Turn 0 mixes a successful tool call with prose-only follow-up.
+        # The tool_call gets executed (counts toward successful_tool_count),
+        # then the prose-only tail triggers force-verdict on turn 1.
+        '<tool_call>{"name":"diag/summary","arguments":{}}</tool_call>',
         "I am thinking about your question.",  # prose only -> triggers force-verdict
         '<verdict>{"summary":"all good after thought","severity":"green","root_cause":"thought_through"}</verdict>',
     ]
@@ -611,8 +640,11 @@ def test_run_troubleshoot_force_verdict_directive_works():
             turn_idx["i"] = i + 1
             return turn_outputs[i] if i < len(turn_outputs) else "(end)"
 
+    async def good_executor(name, args):
+        return {"overall": "green"}
+
     backend = RKLLMBackend(loaded=True, _runtime=StagedRuntime())
-    backend.wire_runtime_deps(tool_executor=None, action_signer=lambda x: "f" * 64)
+    backend.wire_runtime_deps(tool_executor=good_executor, action_signer=lambda x: "f" * 64)
 
     async def collect():
         return [ev async for ev in backend.run_troubleshoot("x")]
@@ -622,8 +654,97 @@ def test_run_troubleshoot_force_verdict_directive_works():
     assert len(verdicts) == 1
     # Real model verdict, NOT the synthetic fallback
     assert verdicts[0]["payload"]["root_cause"] == "thought_through"
-    # The second prompt to the model contained the force-verdict directive
+    # The third prompt to the model contained the force-verdict directive
+    # (turn 0 = inlined system+request, turn 1 = tool_response, turn 2 = directive)
     assert any(FORCE_VERDICT_DIRECTIVE in p for p in prompts_seen)
+
+
+def test_no_evidence_guardrail_overrides_speculative_verdict():
+    """Lab 2026-05-28 not-earning transcript: the model called diag
+    tools, both returned ok=False payload=None (no actual data), and
+    then emitted `severity:red, summary:"Internet slow + clock
+    unsynced"` — a confident-but-fabricated diagnosis pattern-copied
+    from the system prompt's now-deleted GOOD example. Guardrail:
+    when no tool_result has ok=True AND payload non-None, override
+    with insufficient_data severity:yellow so the app's Try-Again
+    button surfaces and the user isn't misled."""
+    import asyncio
+    from src.runtime.rkllm_runtime import RKLLMBackend
+
+    # Single turn: model emits BOTH a failing tool_call AND a
+    # speculative verdict in the same output (the loop processes the
+    # tool_call, gets ok=False from the failing executor, then sees
+    # the verdict and reaches the guardrail check).
+    turn_output = (
+        '<tool_call>{"name":"diag/summary","arguments":{}}</tool_call>\n'
+        '<verdict>{"summary":"Internet slow + clock unsynced.",'
+        '"severity":"red","root_cause":"discovery_unreachable"}</verdict>'
+    )
+    turn_idx = {"i": 0}
+
+    class StagedRuntime:
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
+            i = turn_idx["i"]
+            turn_idx["i"] = i + 1
+            return turn_output if i == 0 else "(end)"
+
+    async def failing_executor(name, args):
+        raise RuntimeError("tool failed to execute (simulating diag exception)")
+
+    backend = RKLLMBackend(loaded=True, _runtime=StagedRuntime())
+    backend.wire_runtime_deps(tool_executor=failing_executor, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("not earning")]
+
+    events = asyncio.run(collect())
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert len(verdicts) == 1
+    # The speculative "Internet slow + clock unsynced" red verdict MUST
+    # be overridden because the tool call failed (ok=False)
+    v = verdicts[0]["payload"]
+    assert v["root_cause"] == "insufficient_data", v
+    assert v["severity"] == "yellow", v
+    assert "diagnostic data" in v["summary"].lower(), v
+    # No recommendations should leak through either
+    recs = [e for e in events if e["type"] == "recommended_action"]
+    assert recs == []
+
+
+def test_no_evidence_guardrail_does_not_override_when_tools_succeeded():
+    """Inverse of the no-evidence test: when ≥1 tool returned real
+    data (ok=True, payload!=None), the model's verdict passes through
+    unmodified. Guardrail must not fire on healthy sessions."""
+    import asyncio
+    from src.runtime.rkllm_runtime import RKLLMBackend
+
+    turn_output = (
+        '<tool_call>{"name":"diag/summary","arguments":{}}</tool_call>\n'
+        '<verdict>{"summary":"All green","severity":"green","root_cause":"healthy"}</verdict>'
+    )
+    turn_idx = {"i": 0}
+
+    class StagedRuntime:
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
+            i = turn_idx["i"]
+            turn_idx["i"] = i + 1
+            return turn_output if i == 0 else "(end)"
+
+    async def good_executor(name, args):
+        return {"overall": "green", "internet": {"status": "green"}}
+
+    backend = RKLLMBackend(loaded=True, _runtime=StagedRuntime())
+    backend.wire_runtime_deps(tool_executor=good_executor, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("status check")]
+
+    events = asyncio.run(collect())
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert len(verdicts) == 1
+    v = verdicts[0]["payload"]
+    assert v["root_cause"] == "healthy", v   # NOT overridden
+    assert v["severity"] == "green", v
 
 
 def test_force_verdict_retry_runs_with_thinking_off():
@@ -639,8 +760,23 @@ def test_force_verdict_retry_runs_with_thinking_off():
     import asyncio
     from src.runtime.rkllm_runtime import RKLLMBackend, FORCE_VERDICT_DIRECTIVE
 
+    # Three-turn sequence so the force-verdict path fires while still
+    # satisfying the no-evidence guardrail:
+    #   turn 0: successful tool_call (gives the loop real data)
+    #   turn 1: prose-only (no tool_call, no verdict) → triggers
+    #           force-verdict directive injection → next_thinking=False
+    #   turn 2: verdict (the directive-driven retry; thinking off)
+    #
+    # Turns 0+1 run with thinking ON so the runtime's built-in template
+    # prepends `<think>\n` and the output therefore CONTAINS the
+    # closing `</think>` marker — without it _strip_think returns
+    # empty and parse_* sees no XML blocks. Turn 2 runs with thinking
+    # OFF (the whole point of this test) so its output has no `<think>`
+    # framing.
     turn_outputs = [
-        "I am rambling about your question.",  # prose only -> force-verdict
+        "<think>quick.</think>\n"
+        '<tool_call>{"name":"diag/summary","arguments":{}}</tool_call>',
+        "<think>still thinking.</think>\nI am rambling about your question.",
         '<verdict>{"summary":"green","severity":"green","root_cause":"ok"}</verdict>',
     ]
     turn_idx = {"i": 0}
@@ -653,6 +789,9 @@ def test_force_verdict_retry_runs_with_thinking_off():
             turn_idx["i"] = i + 1
             return turn_outputs[i] if i < len(turn_outputs) else "(end)"
 
+    async def good_executor(name, args):
+        return {"overall": "green"}
+
     # Simulate a Qwen 3 backend where the default IS thinking-on so we
     # can prove the retry overrides it. Setting _enable_thinking=True
     # bypasses the filename check.
@@ -661,19 +800,21 @@ def test_force_verdict_retry_runs_with_thinking_off():
         _runtime=ThinkingCaptureRuntime(),
         _enable_thinking=True,
     )
-    backend.wire_runtime_deps(tool_executor=None, action_signer=lambda x: "f" * 64)
+    backend.wire_runtime_deps(tool_executor=good_executor, action_signer=lambda x: "f" * 64)
 
     async def collect():
         return [ev async for ev in backend.run_troubleshoot("x")]
 
     events = asyncio.run(collect())
-    # Both turns ran
-    assert len(thinking_per_turn) == 2, thinking_per_turn
-    # Turn 0 used backend's thinking default (True for Qwen 3)
-    assert thinking_per_turn[0] is True, "turn 0 should use backend's thinking default"
-    # Turn 1 (force-verdict retry) MUST run with thinking off so the
-    # full token budget is available for the structured block
-    assert thinking_per_turn[1] is False, "force-verdict retry must run thinking=False"
+    # Three turns ran: tool_call, prose-only, force-verdict retry
+    assert len(thinking_per_turn) == 3, thinking_per_turn
+    # Turns 0 + 1 used backend's thinking default (True for Qwen 3)
+    assert thinking_per_turn[0] is True
+    assert thinking_per_turn[1] is True
+    # Turn 2 (force-verdict retry after prose-only turn 1) MUST run
+    # with thinking off so the full token budget is available for the
+    # structured block.
+    assert thinking_per_turn[2] is False, "force-verdict retry must run thinking=False"
     # Sanity: real verdict came through, not the synthetic fallback
     verdicts = [e for e in events if e["type"] == "verdict"]
     assert verdicts[0]["payload"]["root_cause"] == "ok"

@@ -167,7 +167,7 @@ def test_backend_run_troubleshoot_yields_session_started_first():
 
     events = asyncio.run(collect())
     assert events[0]["type"] == "session_started"
-    assert events[0]["protocol_version"] == 3
+    assert events[0]["protocol_version"] == 4
     # No runtime wired → next event is an error
     assert any(e["type"] == "error" and e.get("code") == "RKLLM_NOT_LOADED"
                for e in events)

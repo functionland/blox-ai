@@ -1086,6 +1086,59 @@ class RKLLMBackend:
         self._action_signer = action_signer
         self._runbook_loader = runbook_loader
 
+    async def classify(self, prompt: str) -> str:
+        """Phase 1.d — LLM-only classifier. Strict prompt, tight budget.
+
+        Returns one of: 'disconnected', 'not-earning', 'cannot-join-pool',
+        'other'. Falls back to 'other' on any LLM error, missing
+        runtime, or unparseable output — the route then leaves it to
+        the app to fall back to current AI mode.
+
+        Locked decision (2026-05-28): no keyword tier in production;
+        LLM-only. MockBackend.classify keeps keyword logic for
+        deterministic tests; this path is the production one."""
+        if not self.loaded or self._runtime is None:
+            return "other"
+        classifier_prompt = (
+            "You classify Fula Blox troubleshooting requests into one of four "
+            "categories. Output EXACTLY one of these words, lowercase, no "
+            "other text, no punctuation, no explanation:\n"
+            "  disconnected\n"
+            "  not-earning\n"
+            "  cannot-join-pool\n"
+            "  other\n\n"
+            "Definitions:\n"
+            "  disconnected: app says blox unreachable; offline; can't see blox\n"
+            "  not-earning: connected but not earning rewards; missing pin income\n"
+            "  cannot-join-pool: trying to join a pool but failing\n"
+            "  other: anything else\n\n"
+            f"User message: {(prompt or '').strip()[:500]}\n\n"
+            "Category:"
+        )
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            text = await loop.run_in_executor(
+                None,
+                lambda: self._runtime.generate(
+                    prompt=classifier_prompt,
+                    role="user",
+                    enable_thinking=False,
+                    keep_history=0,
+                    timeout_s=10.0,
+                ),
+            )
+        except Exception:
+            logger.exception("classify generate() failed; returning 'other'")
+            return "other"
+        normalized = (text or "").lower().strip().strip(".,!?;:")
+        for scenario in ("cannot-join-pool", "not-earning", "disconnected"):
+            # Longer names first so 'disconnected' doesn't shadow
+            # 'cannot-join-pool' if the model output both.
+            if scenario in normalized:
+                return scenario
+        return "other"
+
     async def run_troubleshoot(
         self,
         prompt: str,
@@ -1095,7 +1148,7 @@ class RKLLMBackend:
         yield {
             "type": "session_started",
             "session_id": sid,
-            "protocol_version": 3,
+            "protocol_version": 4,
             "ttl_seconds": 1800,
         }
 

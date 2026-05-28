@@ -98,7 +98,16 @@ def test_execute_happy_path_tier2(client):
     assert body["success"] is True
 
 
-def test_execute_replayed_token_returns_401(client):
+def test_execute_replayed_token_returns_cached_result_phase_1e(client):
+    """Phase 1.e (2026-05-28): replay of a successfully-executed
+    action_id returns the CACHED execution_result (200) instead of
+    the token-replayed error (was 401 in the pre-Phase-1.e impl).
+    Rationale: deterministic tree runs re-emit recommended_action on
+    every SSE resume; without the cache, the app's reducer auto-opens
+    the approval modal again and the user gets a confusing
+    'approval_token_replayed' error for an action that actually ran
+    fine the first time. The new behaviour is true idempotency —
+    same action_id, same response, no re-dispatch."""
     rec = _open_session_and_get_recommendation(client)
     with patch("src.tools.executor.subprocess.run") as sub:
         from subprocess import CompletedProcess
@@ -109,15 +118,20 @@ def test_execute_replayed_token_returns_401(client):
             "approval_token": rec["approval_token"],
         })
         assert r1.status_code == 200
-        # Replay
+        first_body = r1.json()
+        # Replay — same action_id + token.
         r2 = client.post("/execute-action", json={
             "action_id": rec["action_id"],
             "approval_token": rec["approval_token"],
         })
-    assert r2.status_code == 401
-    assert r2.json() == {"type": "error", "code": "APPROVAL_TOKEN_REPLAYED",
-                         "message": "approval_token_replayed",
-                         "recoverable": False}
+        # subprocess should have been called exactly once — the second
+        # call returned the cache without re-dispatching.
+        assert sub.call_count == 1
+    assert r2.status_code == 200
+    # Cached body matches the first response verbatim.
+    assert r2.json() == first_body
+    assert r2.json()["type"] == "execution_result"
+    assert r2.json()["action_id"] == rec["action_id"]
 
 
 def test_audit_log_written_on_happy_path(client):

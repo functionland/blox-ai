@@ -126,9 +126,9 @@ def test_session_started_carries_uuid_session_id(client):
     ), f"expected UUIDv4, got {started['session_id']!r}"
 
 
-def test_session_started_protocol_version_is_3(client):
+def test_session_started_protocol_version_is_4(client):
     events = _events_from_response(_post_troubleshoot(client))
-    assert events[0]["protocol_version"] == 3
+    assert events[0]["protocol_version"] == 4
 
 
 def test_caller_supplied_session_id_is_echoed(client):

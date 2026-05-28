@@ -36,6 +36,20 @@ _PLACEHOLDER_TOKEN = "a" * 64
 ActionSigner = Callable[[str], str]  # action_id → wire-format token
 
 
+_CLASSIFY_KEYWORDS = {
+    "disconnected": (
+        "disconnect", "offline", "not reach", "can't reach", "cant reach",
+        "cant see", "can't see", "lost", "unreachable",
+    ),
+    "not-earning": (
+        "earn", "reward", "pin", "income",
+    ),
+    "cannot-join-pool": (
+        "pool", "join", "membership", "cannot join",
+    ),
+}
+
+
 @dataclass
 class MockBackend:
     """Fake model backend used in dev and when no RKLLM .so is available."""
@@ -44,6 +58,18 @@ class MockBackend:
     loaded: bool = True
     runbook_version: int = 0  # populated in C6 once the loader wires in
     action_signer: Optional[ActionSigner] = field(default=None, repr=False)
+
+    async def classify(self, prompt: str) -> str:
+        """Phase 1.d — deterministic keyword fallback for tests/dev.
+        Production uses RKLLMBackend.classify; the locked decision is
+        LLM-only, no keyword tier in production. MockBackend uses
+        keywords because tests must be deterministic — never wired in
+        prod by lifespan when the real RKLLM .so is present."""
+        p = (prompt or "").lower()
+        for scenario, keywords in _CLASSIFY_KEYWORDS.items():
+            if any(k in p for k in keywords):
+                return scenario
+        return "other"
 
     def _token_for(self, action_id: str) -> str:
         """Mint a real HMAC token via the wired signer, or fall back to
@@ -94,7 +120,7 @@ class MockBackend:
         yield {
             "type": "session_started",
             "session_id": sid,
-            "protocol_version": 3,
+            "protocol_version": 4,
             "ttl_seconds": 1800,
         }
 

@@ -60,6 +60,15 @@ class SessionState:
     # for the executor; the HMAC token binds to action_id, the
     # dispatch table needs action_name + args.
     issued_recommendations: dict[str, dict] = field(default_factory=dict)
+    # Phase 1.e: successful execution_result events keyed by action_id.
+    # The /execute-action route consults this BEFORE calling the
+    # executor — if a result is cached, return it (200 + cached sse_event)
+    # without re-running. Closes the resume-then-tap-again replay loop
+    # that trees expose (LLM didn't trigger this because it doesn't
+    # deterministically re-emit recommended_action on replay).
+    # Only successful (http_status=200) executions are cached; failures
+    # let the user retry.
+    execution_results: dict[str, dict] = field(default_factory=dict)
     # ---- Resume support (added 2026-05-28) -----------------------------
     # event_buffer holds (seq, event) tuples in arrival order. seq is
     # monotonic per-session — even on truncation we keep counting up so

@@ -98,6 +98,41 @@ _CANNED: dict[str, dict] = {
         "online_count": 24, "online_total_expected": 24,
         "online_window_s": 86400,
     },
+    "diag/kubo_health": {
+        "daemon_reachable": True,
+        "peer_id": "12D3KooWCnRuQFScUBTmCi9EMNB7HrWHb12RPUdUZTjJb4FaF1nw",
+        "agent_version": "kubo/0.41.0/", "version": "0.41.0", "commit": "d719fb8",
+        "addresses_count": 8, "swarm_peer_count": 97,
+    },
+    "diag/fula_go_health": {
+        "container_running": True, "container_state": "running",
+        "restart_count": 0,
+        "container_started_at": "2026-05-28T06:21:20Z",
+        "mdns_broadcasts_in_tail": 100,
+        "last_mdns_loaded_ts": "2026-05-28T14:55:20Z",
+        "last_mdns_info": {
+            "BloxPeerIdString": "12D3KooWCnRuQFScUBTmCi9EMNB7HrWHb12RPUdUZTjJb4FaF1nw",
+            "IpfsClusterID":    "12D3KooWE6gC66XWxKacdna5LX4ymwnCCMpaddBFkB8At3WedRaZ",
+            "PoolName":         "1",
+            "Authorizer":       "12D3KooWMyqtPp57DY46FrHheoRPS6PyQvnV2azspWKpgpyde6zg",
+        },
+    },
+    "diag/image_versions": {
+        "containers": [
+            {"container": "fula_go", "actual_image": "functionland/go-fula:test153",
+             "expected_image": "functionland/go-fula:test153", "match": True},
+        ],
+        "mismatched_containers": [],
+        "expected_pins": {"GO_FULA": "functionland/go-fula:test153"},
+    },
+    "diag/ble_state": {"present": True, "session_count_24h": 0},
+    "diag/plugins": {
+        "active": ["blox-ai"],
+        "installed": [
+            {"name": "blox-ai", "display_name": "Blox AI", "version": "202",
+             "status": "Installed", "active": True},
+        ],
+    },
 }
 
 

@@ -1168,6 +1168,346 @@ def test_identity_health_config_yaml_parser_handles_quoted_and_unquoted():
 
 
 # ---------------------------------------------------------------------------
+# diag/kubo_health (Phase 0.5c)
+# ---------------------------------------------------------------------------
+
+def test_kubo_health_happy_path():
+    from src.tools.diag_impls import kubo_health as mod
+    posts = []
+
+    def fake_post(url, body, timeout_s=3.0):
+        posts.append(url)
+        if url.endswith("/id"):
+            return {"ID": "12D3Koo", "AgentVersion": "kubo/0.41.0/",
+                    "Addresses": ["/ip4/x/tcp/4001/p2p/X",
+                                  "/dns/relay/p2p-circuit/p2p/X"]}
+        if url.endswith("/version"):
+            return {"Version": "0.41.0", "Commit": "d719fb8"}
+        if url.endswith("/swarm/peers"):
+            return {"Peers": [{"Peer": "12D3"} for _ in range(97)]}
+        return None
+
+    with patch.object(mod, "http_post_json", side_effect=fake_post):
+        r = mod.diag_kubo_health()
+    assert r["daemon_reachable"] is True
+    assert r["peer_id"] == "12D3Koo"
+    assert r["agent_version"] == "kubo/0.41.0/"
+    assert r["addresses_count"] == 2
+    assert r["version"] == "0.41.0"
+    assert r["commit"] == "d719fb8"
+    assert r["swarm_peer_count"] == 97
+    _validate(r, "kubo_health")
+
+
+def test_kubo_health_daemon_unreachable():
+    from src.tools.diag_impls import kubo_health as mod
+    with patch.object(mod, "http_post_json", return_value=None):
+        r = mod.diag_kubo_health()
+    assert r["daemon_reachable"] is False
+    assert "peer_id" not in r
+    _validate(r, "kubo_health")
+
+
+def test_kubo_health_id_ok_but_version_call_fails():
+    """Partial response — id worked, version didn't. We surface what
+    we have rather than treating the whole call as failed."""
+    from src.tools.diag_impls import kubo_health as mod
+
+    def fake_post(url, body, timeout_s=3.0):
+        if url.endswith("/id"):
+            return {"ID": "X", "AgentVersion": "kubo/0.41.0/", "Addresses": []}
+        return None
+
+    with patch.object(mod, "http_post_json", side_effect=fake_post):
+        r = mod.diag_kubo_health()
+    assert r["daemon_reachable"] is True
+    assert "version" not in r
+    assert "swarm_peer_count" not in r
+    _validate(r, "kubo_health")
+
+
+# ---------------------------------------------------------------------------
+# diag/fula_go_health (Phase 0.5c)
+# ---------------------------------------------------------------------------
+
+_FAKE_FULA_GO_LOG = """\
+2026-05-28T14:53:15.178Z\tINFO\tfula/wap/cmd/mdns\tmdns/mdns.go:145\tmdns info loaded from config file\t{"infoSlice": {"BloxPeerIdString":"12D3KooWCnRu","IpfsClusterID":"12D3KooWE6gC","PoolName":"1","Authorizer":"12D3KooWMyqt","HardwareID":"c6e2a723"}}
+2026-05-28T14:53:20.180Z\tINFO\tfula/wap/cmd/mdns\tmdns/mdns.go:145\tmdns info loaded from config file\t{"infoSlice": {"BloxPeerIdString":"12D3KooWCnRu","IpfsClusterID":"12D3KooWE6gC","PoolName":"1","Authorizer":"12D3KooWMyqt","HardwareID":"c6e2a723"}}
+2026-05-28T14:53:25.180Z\tINFO\tfula/blox\tblox/registration.go:42\tjoined pool successfully\t{"poolId": 1}
+2026-05-28T14:53:30.180Z\tINFO\tfula/wap/cmd/mdns\tmdns/mdns.go:145\tmdns info loaded from config file\t{"infoSlice": {}}
+"""
+
+
+def test_fula_go_health_running_with_recent_mdns_and_pool_event():
+    """Note the (stdout, stderr) split — `docker logs` writes container
+    output to stderr by default. Lab 2026-05-28 caught the regression
+    where the impl was reading stdout only."""
+    from src.tools.diag_impls import fula_go_health as mod
+
+    def fake_run(cmd, timeout_s=5.0):
+        if cmd[0] == "docker" and cmd[1] == "inspect":
+            return 0, "running|0|2026-05-28T06:21:20.874173806Z\n", ""
+        if cmd[0] == "docker" and cmd[1] == "logs":
+            # Container logs land on STDERR per docker convention.
+            return 0, "", _FAKE_FULA_GO_LOG
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_fula_go_health()
+    assert r["container_running"] is True
+    assert r["container_state"] == "running"
+    assert r["restart_count"] == 0
+    assert r["container_started_at"].startswith("2026-05-28T06:21:20")
+    # 3 mdns lines in the fixture, 1 pool event ("joined pool successfully")
+    assert r["mdns_broadcasts_in_tail"] == 3
+    assert r["last_mdns_loaded_ts"] == "2026-05-28T14:53:30.180Z"
+    assert r["last_pool_event_ts"] == "2026-05-28T14:53:25.180Z"
+    assert "joined pool successfully" in r["last_pool_event_excerpt"]
+    assert r["last_mdns_info"]["BloxPeerIdString"] == "12D3KooWCnRu"
+    assert r["last_mdns_info"]["PoolName"] == "1"
+    _validate(r, "fula_go_health")
+
+
+def test_fula_go_health_container_not_running_short_circuits():
+    from src.tools.diag_impls import fula_go_health as mod
+
+    def fake_run(cmd, timeout_s=5.0):
+        if cmd[0] == "docker" and cmd[1] == "inspect":
+            return 0, "exited|3|2026-05-28T06:00:00Z\n", ""
+        # Should NOT be called when container_running=False
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_fula_go_health()
+    assert r["container_running"] is False
+    assert r["container_state"] == "exited"
+    assert r["restart_count"] == 3
+    assert "last_mdns_loaded_ts" not in r
+    _validate(r, "fula_go_health")
+
+
+def test_fula_go_health_inspect_unavailable():
+    from src.tools.diag_impls import fula_go_health as mod
+    with patch.object(mod, "run_subprocess",
+                      return_value=(-1, "", "command not found")):
+        r = mod.diag_fula_go_health()
+    assert r["container_running"] is False
+    _validate(r, "fula_go_health")
+
+
+# ---------------------------------------------------------------------------
+# diag/image_versions (Phase 0.5c)
+# ---------------------------------------------------------------------------
+
+_FAKE_ENV = """\
+GO_FULA=functionland/go-fula:test153
+FX_SUPPROT=functionland/fxsupport:test153
+IPFS_CLUSTER=functionland/ipfs-cluster:test153
+FULA_PINNING=functionland/fula-pinning:test153
+FULA_GATEWAY=functionland/fula-gateway:test153
+WPA_SUPLICANT_PATH=/etc
+CURRENT_USER=pi
+"""
+
+
+def test_image_versions_all_match():
+    from src.tools.diag_impls import image_versions as mod
+
+    def fake_run(cmd, timeout_s=3.0):
+        # docker inspect <c> --format {{.Config.Image}}
+        container = cmd[2]
+        return 0, {
+            "fula_go":        "functionland/go-fula:test153",
+            "fula_fxsupport": "functionland/fxsupport:test153",
+            "ipfs_cluster":   "functionland/ipfs-cluster:test153",
+            "fula_pinning":   "functionland/fula-pinning:test153",
+            "fula_gateway":   "functionland/fula-gateway:test153",
+            "ipfs_host":      "ipfs/kubo:release",
+        }.get(container, "") + "\n", ""
+
+    def fake_open(path, *args, **kwargs):
+        from io import StringIO
+        return StringIO(_FAKE_ENV)
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_image_versions()
+    assert r["mismatched_containers"] == []
+    by_container = {c["container"]: c for c in r["containers"]}
+    assert by_container["fula_go"]["match"] is True
+    assert by_container["fula_go"]["actual_image"] == "functionland/go-fula:test153"
+    assert by_container["fula_go"]["expected_image"] == "functionland/go-fula:test153"
+    assert by_container["ipfs_host"]["expected_image"] == "ipfs/kubo:*"
+    assert by_container["ipfs_host"]["match"] is True
+    _validate(r, "image_versions")
+
+
+def test_image_versions_mismatch_detected():
+    from src.tools.diag_impls import image_versions as mod
+
+    def fake_run(cmd, timeout_s=3.0):
+        container = cmd[2]
+        if container == "fula_go":
+            return 0, "functionland/go-fula:release\n", ""   # DRIFTED
+        return 0, "functionland/x:test153\n", ""
+
+    def fake_open(path, *args, **kwargs):
+        from io import StringIO
+        return StringIO(_FAKE_ENV)
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_image_versions()
+    assert "fula_go" in r["mismatched_containers"]
+    fula_go_entry = [c for c in r["containers"] if c["container"] == "fula_go"][0]
+    assert fula_go_entry["match"] is False
+    _validate(r, "image_versions")
+
+
+def test_image_versions_env_missing_returns_unset_expected():
+    from src.tools.diag_impls import image_versions as mod
+
+    def fake_run(cmd, timeout_s=3.0):
+        return 0, "functionland/go-fula:test153\n", ""
+
+    def fake_open(path, *args, **kwargs):
+        raise FileNotFoundError(path)
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_image_versions()
+    fula_go_entry = [c for c in r["containers"] if c["container"] == "fula_go"][0]
+    assert fula_go_entry["expected_image"] == "unset"
+    # With expected=unset, match defaults to False; mismatched_containers
+    # only includes entries where BOTH actual and expected are present.
+    # So when .env is missing entirely, we surface the actual but don't
+    # flag drift.
+    assert "fula_go" not in r["mismatched_containers"]
+    _validate(r, "image_versions")
+
+
+# ---------------------------------------------------------------------------
+# diag/ble_state (Phase 0.5c)
+# ---------------------------------------------------------------------------
+
+def test_ble_state_present_with_data():
+    from src.tools.diag_impls import ble_state as mod
+    with patch.object(mod, "read_state", return_value={
+        "last_session_ts": "2026-05-28T14:00:00Z",
+        "last_command": "ai/status",
+        "last_command_ts": "2026-05-28T14:30:00Z",
+        "session_count_24h": 5,
+    }):
+        r = mod.diag_ble_state()
+    assert r["present"] is True
+    assert r["last_command"] == "ai/status"
+    assert r["session_count_24h"] == 5
+    _validate(r, "ble_state")
+
+
+def test_ble_state_missing_returns_null():
+    from src.tools.diag_impls import ble_state as mod
+    with patch.object(mod, "read_state", return_value={}):
+        r = mod.diag_ble_state()
+    assert r["present"] is None
+    assert "last_command" not in r
+    _validate(r, "ble_state")
+
+
+# ---------------------------------------------------------------------------
+# diag/plugins (Phase 0.5c)
+# ---------------------------------------------------------------------------
+
+def test_plugins_with_active_blox_ai():
+    from src.tools.diag_impls import plugins as mod
+
+    fake_files = {
+        "/home/pi/.internal/plugins/active-plugins.txt": "blox-ai\n",
+        "/home/pi/.internal/plugins/blox-ai/status.txt": "Installed\n",
+        "/usr/bin/fula/plugins/blox-ai/info.json": json.dumps({
+            "name": "blox-ai", "display_name": "Blox AI",
+            "version": "202", "description": "On-device AI assistant.",
+        }),
+    }
+
+    def fake_open(path, *args, **kwargs):
+        from io import StringIO
+        if path in fake_files:
+            return StringIO(fake_files[path])
+        raise FileNotFoundError(path)
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "ls":
+            # active-plugins.txt + update-plugins.txt + blox-ai dir
+            return 0, "active-plugins.txt\nupdate-plugins.txt\nblox-ai\n", ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_plugins()
+    assert r["active"] == ["blox-ai"]
+    assert len(r["installed"]) == 1
+    plugin = r["installed"][0]
+    assert plugin["name"] == "blox-ai"
+    assert plugin["active"] is True
+    assert plugin["status"] == "Installed"
+    assert plugin["display_name"] == "Blox AI"
+    assert plugin["version"] == "202"
+    _validate(r, "plugins")
+
+
+def test_plugins_no_active_plugins():
+    from src.tools.diag_impls import plugins as mod
+
+    def fake_open(path, *args, **kwargs):
+        raise FileNotFoundError(path)
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "ls":
+            return -1, "", ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_plugins()
+    assert r["active"] == []
+    assert r["installed"] == []
+    _validate(r, "plugins")
+
+
+def test_plugins_installed_but_not_active():
+    """Plugin install in progress, manager hasn't picked it up yet."""
+    from src.tools.diag_impls import plugins as mod
+
+    fake_files = {
+        "/home/pi/.internal/plugins/active-plugins.txt": "",
+        "/home/pi/.internal/plugins/blox-ai/status.txt": "Installing\n",
+        "/usr/bin/fula/plugins/blox-ai/info.json": '{"version":"202"}',
+    }
+
+    def fake_open(path, *args, **kwargs):
+        from io import StringIO
+        if path in fake_files:
+            return StringIO(fake_files[path])
+        raise FileNotFoundError(path)
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "ls":
+            return 0, "active-plugins.txt\nblox-ai\n", ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch("builtins.open", side_effect=fake_open):
+        r = mod.diag_plugins()
+    assert r["active"] == []
+    assert len(r["installed"]) == 1
+    plugin = r["installed"][0]
+    assert plugin["active"] is False
+    assert plugin["status"] == "Installing"
+    _validate(r, "plugins")
+
+
+# ---------------------------------------------------------------------------
 # diag/summary
 # ---------------------------------------------------------------------------
 
@@ -1249,6 +1589,9 @@ _EXPECTED_TOOL_SET = {
     "diag/discovery_state", "diag/systemd_services", "diag/network_interface",
     # Phase 0.5b additions (uniondrive + identity_health, schema v3)
     "diag/uniondrive", "diag/identity_health",
+    # Phase 0.5c additions (kubo/fula_go/image_versions/ble/plugins, schema v4)
+    "diag/kubo_health", "diag/fula_go_health", "diag/image_versions",
+    "diag/ble_state", "diag/plugins",
 }
 
 

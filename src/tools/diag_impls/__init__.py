@@ -11,13 +11,18 @@ import logging
 from typing import Callable, Any
 
 
+from src.tools.diag_impls.ble_state import diag_ble_state
 from src.tools.diag_impls.containers import diag_containers
 from src.tools.diag_impls.discovery_state import diag_discovery_state
 from src.tools.diag_impls.events import diag_events
+from src.tools.diag_impls.fula_go_health import diag_fula_go_health
 from src.tools.diag_impls.heartbeat import diag_heartbeat
 from src.tools.diag_impls.identity_health import diag_identity_health
+from src.tools.diag_impls.image_versions import diag_image_versions
 from src.tools.diag_impls.internet import diag_internet
+from src.tools.diag_impls.kubo_health import diag_kubo_health
 from src.tools.diag_impls.network_interface import diag_network_interface
+from src.tools.diag_impls.plugins import diag_plugins
 from src.tools.diag_impls.power import diag_power
 from src.tools.diag_impls.readiness import diag_readiness
 from src.tools.diag_impls.relay import diag_relay
@@ -53,6 +58,11 @@ _DISPATCH: dict[str, Callable[[], dict]] = {
     "diag/network_interface":  diag_network_interface,
     "diag/uniondrive":         diag_uniondrive,
     "diag/identity_health":    diag_identity_health,
+    "diag/kubo_health":        diag_kubo_health,
+    "diag/fula_go_health":     diag_fula_go_health,
+    "diag/image_versions":     diag_image_versions,
+    "diag/ble_state":          diag_ble_state,
+    "diag/plugins":            diag_plugins,
 }
 
 

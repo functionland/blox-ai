@@ -24,6 +24,7 @@ ToolName = Literal[
     "wireguard", "heartbeat", "events", "readiness", "summary",
     "discovery_state", "systemd_services", "network_interface",
     "uniondrive", "identity_health",
+    "kubo_health", "fula_go_health", "image_versions", "ble_state", "plugins",
 ]
 
 

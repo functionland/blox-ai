@@ -4,10 +4,11 @@ from __future__ import annotations
 import pytest
 
 
-# All 11 tool names that should resolve as path params.
+# All 14 tool names that should resolve as path params.
 ALL_TOOLS = [
     "internet", "relay", "time", "power", "storage", "containers",
     "wireguard", "heartbeat", "events", "readiness", "summary",
+    "discovery_state", "systemd_services", "network_interface",
 ]
 
 

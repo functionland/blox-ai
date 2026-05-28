@@ -62,6 +62,25 @@ _CANNED: dict[str, dict] = {
             "wireguard": "green",
         },
     },
+    "diag/discovery_state": {
+        "ok": True, "last_check_ts": "2026-05-28T19:00:00Z", "latency_ms": 32,
+    },
+    "diag/systemd_services": {
+        "services": [
+            {"name": "fula.service", "active": True, "state": "active",
+             "sub_state": "running", "result": "success"},
+        ],
+    },
+    "diag/network_interface": {
+        "interfaces": [
+            {"name": "wlan0", "operstate": "UP", "mtu": 1500,
+             "mac": "aa:bb:cc:dd:ee:ff",
+             "ipv4": ["192.168.1.50"], "ipv6": [],
+             "wifi_associated": True, "wifi_ssid": "FakeWifi",
+             "wifi_signal_dbm": -55},
+        ],
+        "tools_present": {"ip": True, "iw": True},
+    },
 }
 
 

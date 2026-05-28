@@ -436,6 +436,282 @@ def test_readiness_journalctl_unavailable():
 
 
 # ---------------------------------------------------------------------------
+# diag/discovery_state (Phase 0.5a)
+# ---------------------------------------------------------------------------
+
+def test_discovery_state_happy_path():
+    from src.tools.diag_impls import discovery_state as mod
+    with patch.object(mod, "read_state", return_value={
+        "ok": True,
+        "last_check_ts": "2026-05-28T19:00:00Z",
+        "latency_ms": 42.5,
+    }):
+        r = mod.diag_discovery_state()
+    assert r["ok"] is True
+    assert r["last_check_ts"] == "2026-05-28T19:00:00Z"
+    assert r["latency_ms"] == 42.5
+    _validate(r, "discovery_state")
+
+
+def test_discovery_state_missing_file_returns_null_ok():
+    """Pre-Phase-1.2 firmware (or fresh boot before first cycle) has no
+    state file. Tristate `ok=null` lets trees branch on 'unknown'."""
+    from src.tools.diag_impls import discovery_state as mod
+    with patch.object(mod, "read_state", return_value={}):
+        r = mod.diag_discovery_state()
+    assert r["ok"] is None
+    _validate(r, "discovery_state")
+
+
+def test_discovery_state_with_error():
+    from src.tools.diag_impls import discovery_state as mod
+    with patch.object(mod, "read_state", return_value={
+        "ok": False,
+        "error": "HTTPSConnectionPool: connection timeout",
+    }):
+        r = mod.diag_discovery_state()
+    assert r["ok"] is False
+    assert "timeout" in r["error"]
+    _validate(r, "discovery_state")
+
+
+def test_discovery_state_error_is_truncated_at_500():
+    from src.tools.diag_impls import discovery_state as mod
+    long_err = "x" * 2000
+    with patch.object(mod, "read_state", return_value={
+        "ok": False, "error": long_err,
+    }):
+        r = mod.diag_discovery_state()
+    assert len(r["error"]) == 500
+    _validate(r, "discovery_state")
+
+
+def test_discovery_state_ignores_non_bool_ok():
+    """Defensive: if a future writer wrote a string instead of bool, we
+    surface it as `null` rather than passing a typed-wrong value through."""
+    from src.tools.diag_impls import discovery_state as mod
+    with patch.object(mod, "read_state", return_value={"ok": "yes"}):
+        r = mod.diag_discovery_state()
+    assert r["ok"] is None
+    _validate(r, "discovery_state")
+
+
+# ---------------------------------------------------------------------------
+# diag/systemd_services (Phase 0.5a)
+# ---------------------------------------------------------------------------
+
+def test_systemd_services_all_active():
+    from src.tools.diag_impls import systemd_services as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[1] == "is-active":
+            return 0, "active\n", ""
+        # systemctl show
+        return 0, "Result=success\nSubState=running\n", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_systemd_services()
+    assert len(r["services"]) == len(mod.FULA_UNITS)
+    for svc in r["services"]:
+        assert svc["active"] is True
+        assert svc["state"] == "active"
+        assert svc["sub_state"] == "running"
+    _validate(r, "systemd_services")
+
+
+def test_systemd_services_unit_failed():
+    from src.tools.diag_impls import systemd_services as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[1] == "is-active":
+            return 3, "failed\n", ""
+        return 0, "Result=exit-code\nSubState=failed\n", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_systemd_services()
+    for svc in r["services"]:
+        assert svc["active"] is False
+        assert svc["state"] == "failed"
+        assert svc["result"] == "exit-code"
+    _validate(r, "systemd_services")
+
+
+def test_systemd_services_systemctl_missing():
+    """Dev host / container without systemd: every unit comes back as
+    unknown, NOT silently false. Trees should branch on `unknown`."""
+    from src.tools.diag_impls import systemd_services as mod
+    with patch.object(mod, "run_subprocess",
+                      return_value=(-1, "", "command not found")):
+        r = mod.diag_systemd_services()
+    for svc in r["services"]:
+        assert svc["active"] is None
+        assert svc["state"] == "unknown"
+    _validate(r, "systemd_services")
+
+
+def test_systemd_services_per_unit_timeout_is_isolated():
+    """A hung systemctl on ONE unit must not poison the others.
+
+    Impl shape: on is-active rc=-1 the impl returns early without
+    invoking the show subprocess (early-return is what gives us the
+    isolation). So a timeout on unit[0]'s is-active = ONE subprocess
+    call total for that unit, then units 1..N each take 2 calls
+    (is-active + show)."""
+    from src.tools.diag_impls import systemd_services as mod
+    call_count = {"n": 0}
+
+    def fake_run(cmd, timeout_s=2.0):
+        call_count["n"] += 1
+        # ONLY the very first call (unit[0]'s is-active) times out.
+        if call_count["n"] == 1:
+            return -1, "", "timeout after 2.0s"
+        if cmd[1] == "is-active":
+            return 0, "active\n", ""
+        return 0, "Result=success\nSubState=running\n", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_systemd_services()
+    # First unit returns the unknown fallback; rest are active.
+    assert r["services"][0]["active"] is None
+    assert r["services"][0]["state"] == "unknown"
+    for svc in r["services"][1:]:
+        assert svc["active"] is True, f"{svc['name']} should be active"
+    _validate(r, "systemd_services")
+
+
+# ---------------------------------------------------------------------------
+# diag/network_interface (Phase 0.5a)
+# ---------------------------------------------------------------------------
+
+_FAKE_IP_ADDR_JSON = """[
+  {"ifname": "lo", "operstate": "UNKNOWN", "addr_info": [
+    {"family": "inet", "local": "127.0.0.1"}
+  ]},
+  {"ifname": "wlan0", "operstate": "UP", "mtu": 1500,
+   "address": "aa:bb:cc:dd:ee:ff",
+   "addr_info": [
+     {"family": "inet", "local": "192.168.1.50"},
+     {"family": "inet6", "local": "2001:db8::1"},
+     {"family": "inet6", "local": "fe80::1"}
+   ]},
+  {"ifname": "eth0", "operstate": "DOWN", "addr_info": []}
+]"""
+
+_FAKE_IW_LINK_CONNECTED = """\
+Connected to aa:bb:cc:dd:ee:ff (on wlan0)
+        SSID: MyHomeWiFi
+        freq: 5180
+        signal: -55 dBm
+        tx bitrate: 130.0 MBit/s VHT-MCS 7 80MHz short GI
+"""
+
+_FAKE_IW_LINK_DISCONNECTED = "Not connected.\n"
+
+
+def test_network_interface_happy_path_wifi_associated():
+    from src.tools.diag_impls import network_interface as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return 0, cmd[1] + "\n", ""
+        if cmd[0] == "ip":
+            return 0, _FAKE_IP_ADDR_JSON, ""
+        if cmd[0] == "iw" and cmd[1] == "dev":
+            return 0, _FAKE_IW_LINK_CONNECTED, ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_network_interface()
+    assert r["tools_present"]["ip"] is True
+    assert r["tools_present"]["iw"] is True
+    # lo dropped; wlan0 + eth0 kept
+    names = sorted([i["name"] for i in r["interfaces"]])
+    assert names == ["eth0", "wlan0"]
+    wlan = [i for i in r["interfaces"] if i["name"] == "wlan0"][0]
+    assert wlan["operstate"] == "UP"
+    assert wlan["mtu"] == 1500
+    assert wlan["mac"] == "aa:bb:cc:dd:ee:ff"
+    assert wlan["ipv4"] == ["192.168.1.50"]
+    # link-local fe80:: must be stripped
+    assert wlan["ipv6"] == ["2001:db8::1"]
+    assert wlan["wifi_associated"] is True
+    assert wlan["wifi_ssid"] == "MyHomeWiFi"
+    assert wlan["wifi_signal_dbm"] == -55
+    assert wlan["wifi_tx_bitrate_mbps"] == 130.0
+    assert wlan["wifi_freq_mhz"] == 5180
+    _validate(r, "network_interface")
+
+
+def test_network_interface_wifi_not_associated():
+    from src.tools.diag_impls import network_interface as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return 0, "", ""
+        if cmd[0] == "ip":
+            return 0, _FAKE_IP_ADDR_JSON, ""
+        if cmd[0] == "iw":
+            return 0, _FAKE_IW_LINK_DISCONNECTED, ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_network_interface()
+    wlan = [i for i in r["interfaces"] if i["name"] == "wlan0"][0]
+    assert wlan["wifi_associated"] is False
+    assert "wifi_ssid" not in wlan
+    _validate(r, "network_interface")
+
+
+def test_network_interface_ip_missing_returns_empty_with_flag():
+    """Stripped build with no iproute2: trees branch on tools_present.ip
+    instead of misreading empty interfaces as 'no network'."""
+    from src.tools.diag_impls import network_interface as mod
+    with patch.object(mod, "run_subprocess",
+                      return_value=(-1, "", "command not found")):
+        r = mod.diag_network_interface()
+    assert r["tools_present"]["ip"] is False
+    assert r["interfaces"] == []
+    _validate(r, "network_interface")
+
+
+def test_network_interface_iw_missing_skips_wifi_fields():
+    """ip present but iw missing → links enumerate but no wifi_* fields."""
+    from src.tools.diag_impls import network_interface as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return (0, "", "") if cmd[1] == "ip" else (-1, "", "")
+        if cmd[0] == "ip":
+            return 0, _FAKE_IP_ADDR_JSON, ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_network_interface()
+    assert r["tools_present"]["ip"] is True
+    assert r["tools_present"]["iw"] is False
+    wlan = [i for i in r["interfaces"] if i["name"] == "wlan0"][0]
+    assert "wifi_ssid" not in wlan
+    assert "wifi_associated" not in wlan
+    _validate(r, "network_interface")
+
+
+def test_network_interface_malformed_json_returns_empty():
+    from src.tools.diag_impls import network_interface as mod
+
+    def fake_run(cmd, timeout_s=2.0):
+        if cmd[0] == "which":
+            return 0, "", ""
+        if cmd[0] == "ip":
+            return 0, "not json {{{", ""
+        return -1, "", ""
+
+    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+        r = mod.diag_network_interface()
+    assert r["interfaces"] == []
+    _validate(r, "network_interface")
+
+
+# ---------------------------------------------------------------------------
 # diag/summary
 # ---------------------------------------------------------------------------
 
@@ -508,29 +784,31 @@ def test_summary_overall_severity_logic():
 # RealDiagExecutor dispatch
 # ---------------------------------------------------------------------------
 
-def test_real_executor_dispatches_all_11_tools():
+_EXPECTED_TOOL_SET = {
+    # diag/* originals (Phase 9, schema v1)
+    "diag/internet", "diag/relay", "diag/time", "diag/power",
+    "diag/storage", "diag/containers", "diag/wireguard",
+    "diag/heartbeat", "diag/events", "diag/readiness", "diag/summary",
+    # Phase 0.5a additions (deterministic-tree foundation, schema v2)
+    "diag/discovery_state", "diag/systemd_services", "diag/network_interface",
+}
+
+
+def test_real_executor_dispatches_all_tools():
     """Sanity: every tool name resolves to an impl + the executor raises
     UnknownToolError on bad names. Uses asyncio.run rather than the
     pytest-asyncio plugin (one extra dep we don't otherwise need)."""
     import asyncio
     from src.tools.diag_impls import RealDiagExecutor, known_tools, UnknownToolError
     ex = RealDiagExecutor()
-    assert set(known_tools()) == {
-        "diag/internet", "diag/relay", "diag/time", "diag/power",
-        "diag/storage", "diag/containers", "diag/wireguard",
-        "diag/heartbeat", "diag/events", "diag/readiness", "diag/summary",
-    }
+    assert set(known_tools()) == _EXPECTED_TOOL_SET
     with pytest.raises(UnknownToolError):
         asyncio.run(ex("diag/no-such-tool", {}))
 
 
 def test_real_executor_known_tools_set_matches_schema():
-    """The 11 tools listed in fula-ota's ble_commands.json MUST all be
-    in known_tools(). Cross-runtime contract."""
+    """Every tool listed in fula-ota's ble_commands.json MUST be in
+    known_tools(). Cross-runtime contract — drift here means a BLE
+    invocation will hit a 404 at runtime."""
     from src.tools.diag_impls import known_tools
-    expected = {
-        "diag/internet", "diag/relay", "diag/time", "diag/power",
-        "diag/storage", "diag/containers", "diag/wireguard",
-        "diag/heartbeat", "diag/events", "diag/readiness", "diag/summary",
-    }
-    assert set(known_tools()) == expected
+    assert set(known_tools()) == _EXPECTED_TOOL_SET

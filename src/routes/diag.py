@@ -22,6 +22,7 @@ logger = logging.getLogger("blox-ai.routes.diag")
 ToolName = Literal[
     "internet", "relay", "time", "power", "storage", "containers",
     "wireguard", "heartbeat", "events", "readiness", "summary",
+    "discovery_state", "systemd_services", "network_interface",
 ]
 
 

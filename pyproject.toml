@@ -10,6 +10,16 @@ dependencies = [
     "jsonschema>=4.20,<5",
     "pydantic>=2.6,<3",
     "docker>=7.0,<8",
+    # Phase 1.a — safe expression evaluator for tree DSL conditions
+    # (e.g. "result.ok == false && result.swarm_peer_count < 5").
+    # Whitelist-based; no eval()/exec() escape hatches. ~50KB pure Python.
+    "simpleeval>=0.9,<1",
+    # Phase 1.a — YAML loader for tree definitions. Required by the
+    # tree DSL; the previous Phase 0.5b config.yaml parser was an
+    # ad-hoc subset, but tree YAML uses full block scalars + lists +
+    # nested mappings so we need a real parser. PyYAML is the
+    # standard; already present transitively via docker SDK.
+    "pyyaml>=6,<7",
 ]
 
 [project.optional-dependencies]

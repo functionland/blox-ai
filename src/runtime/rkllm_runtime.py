@@ -625,7 +625,27 @@ The three allowed blocks:
 
 Your VERY FIRST output token MUST start a <tool_call> block. Do NOT
 repeat these instructions back. Do NOT acknowledge. Do NOT explain
-what you are about to do. Start with `<tool_call>{{"name":"diag/`.
+what you are about to do. Do NOT use markdown headings (#, ##).
+Start with `<tool_call>{{"name":"diag/`.
+
+# FORMAT SHAPE — mimic the STRUCTURE, not the words
+
+Below is the SHAPE a healthy session takes across three model turns.
+**The words are placeholders. Do NOT copy them. Do NOT mention any
+of the placeholder labels in your output.** Use the actual user
+request + real <tool_response> data you receive to fill in your own
+content.
+
+Turn 1 (after the user's request arrives):
+<tool_call>{{"name":"diag/<TOOL_NAME>","arguments":{{}}}}</tool_call>
+
+Turn 2 (after the runtime injects a <tool_response>...</tool_response>
+into your context):
+<tool_call>{{"name":"diag/<NEXT_TOOL>","arguments":{{}}}}</tool_call>
+
+Turn 3 (when you've seen enough tool data to decide):
+<verdict>{{"summary":"<ONE_SENTENCE_FROM_YOUR_DATA>","severity":"<green|yellow|red>","root_cause":"<SHORT_TOKEN>"}}</verdict>
+<recommendation>{{"action_name":"<one_of_the_action_names_above>","args":{{}},"reasoning":"<WHY_FROM_YOUR_DATA>","confidence":<0_TO_1>,"tier":<2_OR_3>}}</recommendation>
 
 # VERDICT RULES
 
@@ -1183,13 +1203,89 @@ class RKLLMBackend:
                     ),
                 )
             except RKLLMLoadError as e:
-                yield {
-                    "type": "error",
-                    "code": "RKLLM_GENERATE_FAILED",
-                    "message": str(e)[:500],
-                    "recoverable": False,
-                }
-                return
+                err_msg = str(e)
+                # rc=-1 from rkllm_run typically indicates the runtime
+                # is in a stuck state (KV cache corruption after an
+                # aborted prior generation, partial template state,
+                # etc.). The only known recovery is destroy + re-init.
+                # Try ONCE per turn — if the retry also fails, surface
+                # the error AND emit a synthetic insufficient_data
+                # verdict so the app's Try-Again button still surfaces
+                # (the bare error event currently has no Try-Again gate).
+                #
+                # We only attempt re-init for the rc=-1 family ("returned -1"
+                # in the message) — other errors (timeouts, callback
+                # signalled RUN_ERROR, init failed) point at deeper
+                # issues that re-init won't fix and that should bubble
+                # to the user with the original message intact.
+                reinit_ok = False
+                if "returned -1" in err_msg:
+                    try:
+                        logger.warning(
+                            "rkllm_run returned -1; destroying + re-initializing runtime"
+                        )
+                        self._runtime.destroy()
+                        self._runtime.init_model()
+                        reinit_ok = True
+                    except Exception as reinit_e:  # noqa: BLE001
+                        logger.exception(
+                            "rkllm re-init failed after rc=-1: %s", reinit_e
+                        )
+
+                if reinit_ok:
+                    # Retry the SAME generate() call once. keep_history
+                    # is reset because destroy() wiped the KV cache.
+                    try:
+                        output = await loop.run_in_executor(
+                            None,
+                            lambda r=next_role, c=next_content, t=next_thinking: (
+                                self._runtime.generate(
+                                    c,
+                                    role=r,
+                                    enable_thinking=t,
+                                    keep_history=0,  # cache was wiped
+                                    timeout_s=PER_TURN_TIMEOUT_S,
+                                )
+                            ),
+                        )
+                    except (RKLLMLoadError, asyncio.TimeoutError) as retry_e:
+                        # Retry also failed — surface both the error
+                        # event AND a synthetic verdict so Try-Again
+                        # is reachable.
+                        yield {
+                            "type": "error",
+                            "code": "RKLLM_GENERATE_FAILED",
+                            "message": f"after re-init retry: {str(retry_e)[:400]}",
+                            "recoverable": True,
+                        }
+                        yield {
+                            "type": "verdict",
+                            "payload": {
+                                "summary": "Blox AI runtime stalled; please try again.",
+                                "severity": "yellow",
+                                "root_cause": "insufficient_data",
+                            },
+                        }
+                        return
+                else:
+                    # Initial -1 + re-init failed, OR a non--1 RKLLM
+                    # error. Surface as before + emit a synthetic
+                    # verdict so Try-Again is reachable.
+                    yield {
+                        "type": "error",
+                        "code": "RKLLM_GENERATE_FAILED",
+                        "message": err_msg[:500],
+                        "recoverable": True,
+                    }
+                    yield {
+                        "type": "verdict",
+                        "payload": {
+                            "summary": "Blox AI runtime stalled; please try again.",
+                            "severity": "yellow",
+                            "root_cause": "insufficient_data",
+                        },
+                    }
+                    return
             except asyncio.TimeoutError:
                 yield {
                     "type": "error",

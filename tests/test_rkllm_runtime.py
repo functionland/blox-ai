@@ -586,6 +586,109 @@ def test_guardrail_does_not_drop_when_user_did_NOT_complain_about_connectivity()
     assert out[0]["confidence"] == 0.6  # but still capped
 
 
+def test_rkllm_minus_one_triggers_destroy_reinit_and_retry():
+    """Lab 2026-05-28: clicking Retry on a previous session sometimes
+    hit `rkllm_run returned -1` at T+0s — the native runtime gets
+    stuck after an aborted prior generation. The bridge now destroys
+    + re-inits the runtime + retries the same generate() call ONCE
+    before yielding the error. If the retry succeeds, the model's
+    output proceeds normally; if it fails, we yield the error AND
+    a synthetic insufficient_data verdict so the app's Try-Again
+    CTA surfaces (raw error events have no Try-Again gate)."""
+    import asyncio
+    from src.runtime.rkllm_runtime import RKLLMBackend, RKLLMLoadError
+
+    state = {"calls": 0, "destroyed": False, "reinited": False}
+
+    class FlakyRuntime:
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise RKLLMLoadError("rkllm_run returned -1")
+            # After re-init, second call succeeds with a verdict-only
+            # output (no tool_call) so the loop terminates cleanly on
+            # the next condition check. The runtime guard fires only
+            # once per generate call, so loop-iteration ends here.
+            return (
+                '<verdict>{"summary":"ok now","severity":"green","root_cause":"recovered_after_reinit"}</verdict>'
+            )
+
+        def destroy(self):
+            state["destroyed"] = True
+
+        def init_model(self):
+            state["reinited"] = True
+
+    backend = RKLLMBackend(loaded=True, _runtime=FlakyRuntime())
+    backend.wire_runtime_deps(tool_executor=None, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("retry")]
+
+    events = asyncio.run(collect())
+    # Runtime was destroyed + re-inited
+    assert state["destroyed"] is True
+    assert state["reinited"] is True
+    # 2 calls inside turn 0 (initial -1 + retry) is what we want; the
+    # no-evidence guardrail then overrides because no tool calls
+    # succeeded, but the runtime calls are bounded.
+    assert state["calls"] == 2
+    # A verdict came through — either the model's recovered_after_reinit
+    # OR the no-evidence guardrail's insufficient_data override (both
+    # acceptable here; the point is the runtime recovered).
+    verdicts = [e for e in events if e["type"] == "verdict"]
+    assert len(verdicts) == 1
+    assert verdicts[0]["payload"]["root_cause"] in (
+        "recovered_after_reinit",
+        "insufficient_data",
+    ), verdicts[0]
+
+
+def test_rkllm_minus_one_retry_failure_emits_error_plus_synthetic_verdict():
+    """If the re-init retry ALSO returns -1 (or any other failure),
+    the bridge emits the error event AND a synthetic insufficient_data
+    verdict in the same stream so the app's synthetic-detector
+    triggers the Try-Again button. Without the second yield the user
+    is stuck on a bare error with only Start-new-chat."""
+    import asyncio
+    from src.runtime.rkllm_runtime import RKLLMBackend, RKLLMLoadError
+
+    state = {"calls": 0}
+
+    class StuckRuntime:
+        def generate(self, prompt, role="user", enable_thinking=False, keep_history=0, timeout_s=90.0):
+            state["calls"] += 1
+            raise RKLLMLoadError("rkllm_run returned -1")
+
+        def destroy(self):
+            pass
+
+        def init_model(self):
+            pass
+
+    backend = RKLLMBackend(loaded=True, _runtime=StuckRuntime())
+    backend.wire_runtime_deps(tool_executor=None, action_signer=lambda x: "f" * 64)
+
+    async def collect():
+        return [ev async for ev in backend.run_troubleshoot("retry")]
+
+    events = asyncio.run(collect())
+
+    # Two generate attempts were made (original + retry post re-init)
+    assert state["calls"] == 2
+    types = [e["type"] for e in events]
+    # Error event present
+    assert "error" in types
+    err = next(e for e in events if e["type"] == "error")
+    assert err["code"] == "RKLLM_GENERATE_FAILED"
+    assert "after re-init retry" in err["message"]
+    assert err["recoverable"] is True
+    # Synthetic insufficient_data verdict present so Try-Again surfaces
+    assert "verdict" in types
+    verdict = next(e for e in events if e["type"] == "verdict")
+    assert verdict["payload"]["root_cause"] == "insufficient_data"
+
+
 def test_run_troubleshoot_terminates_when_model_only_emits_prose():
     """If the model produces no verdict + no tool_calls, the backend
     INJECTS a force-verdict directive + gives the model one more chance.

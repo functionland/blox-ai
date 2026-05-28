@@ -21,10 +21,19 @@ Graceful fallback: missing tools → `tools_present` lists what's present;
 trees can branch on `wifi_supported: false` instead of treating a
 missing `wifi_ssid` field as "user disconnected from WiFi" (false
 positive).
+
+WiFi-detection note: original implementation used a name-prefix
+heuristic (`wlan` / `wlp` / `wlx`). Lab smoke 2026-05-28 caught a
+real-world miss on `wlP2p33s0` (the RK3588 Pi's WiFi adapter name —
+capital `P` from systemd-predictable naming). Switched to
+`/sys/class/net/<iface>/wireless` directory existence, which is the
+kernel-canonical signal for any wireless interface regardless of
+naming scheme.
 """
 from __future__ import annotations
 
 import json
+import os
 
 from src.tools.diag_impls._helpers import run_subprocess
 
@@ -105,10 +114,16 @@ def _summarize_link(link: dict) -> dict:
 
 
 def _looks_like_wifi(ifname: str) -> bool:
-    """Heuristic: only call `iw` for likely-WiFi names. Avoids spurious
-    "Device or resource busy" errors when calling iw on bridge or
-    docker interfaces."""
-    return ifname.startswith(("wlan", "wlp", "wlx"))
+    """Kernel-canonical WiFi detection: the cfg80211 layer creates
+    `/sys/class/net/<ifname>/wireless` for any wireless interface. No
+    name guessing — works for `wlan0`, `wlp1s0`, `wlx00:11:..`,
+    `wlP2p33s0` (the RK3588 lab device — original name-prefix heuristic
+    missed this), and any future systemd naming scheme.
+
+    On non-Linux hosts (Windows/macOS dev) `/sys` does not exist; the
+    `os.path.isdir` returns False, which is the right answer because
+    `iw` doesn't exist there either."""
+    return os.path.isdir(f"/sys/class/net/{ifname}/wireless")
 
 
 def _iw_link(ifname: str) -> dict:

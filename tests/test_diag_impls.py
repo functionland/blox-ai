@@ -620,7 +620,9 @@ def test_network_interface_happy_path_wifi_associated():
             return 0, _FAKE_IW_LINK_CONNECTED, ""
         return -1, "", ""
 
-    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+    # Treat ONLY wlan0 as wireless per sysfs check.
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch.object(mod, "_looks_like_wifi", side_effect=lambda n: n == "wlan0"):
         r = mod.diag_network_interface()
     assert r["tools_present"]["ip"] is True
     assert r["tools_present"]["iw"] is True
@@ -639,6 +641,10 @@ def test_network_interface_happy_path_wifi_associated():
     assert wlan["wifi_signal_dbm"] == -55
     assert wlan["wifi_tx_bitrate_mbps"] == 130.0
     assert wlan["wifi_freq_mhz"] == 5180
+    # eth0 must NOT have wifi_* fields applied (sysfs gating works)
+    eth = [i for i in r["interfaces"] if i["name"] == "eth0"][0]
+    assert "wifi_ssid" not in eth
+    assert "wifi_associated" not in eth
     _validate(r, "network_interface")
 
 
@@ -654,7 +660,8 @@ def test_network_interface_wifi_not_associated():
             return 0, _FAKE_IW_LINK_DISCONNECTED, ""
         return -1, "", ""
 
-    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch.object(mod, "_looks_like_wifi", side_effect=lambda n: n == "wlan0"):
         r = mod.diag_network_interface()
     wlan = [i for i in r["interfaces"] if i["name"] == "wlan0"][0]
     assert wlan["wifi_associated"] is False
@@ -685,7 +692,8 @@ def test_network_interface_iw_missing_skips_wifi_fields():
             return 0, _FAKE_IP_ADDR_JSON, ""
         return -1, "", ""
 
-    with patch.object(mod, "run_subprocess", side_effect=fake_run):
+    with patch.object(mod, "run_subprocess", side_effect=fake_run), \
+         patch.object(mod, "_looks_like_wifi", side_effect=lambda n: n == "wlan0"):
         r = mod.diag_network_interface()
     assert r["tools_present"]["ip"] is True
     assert r["tools_present"]["iw"] is False
@@ -709,6 +717,30 @@ def test_network_interface_malformed_json_returns_empty():
         r = mod.diag_network_interface()
     assert r["interfaces"] == []
     _validate(r, "network_interface")
+
+
+def test_network_interface_sysfs_wifi_detection_handles_capital_p():
+    """Regression guard 2026-05-28: lab smoke caught wlP2p33s0 (RK3588 Pi's
+    WiFi adapter — capital P from systemd-predictable naming) being missed
+    by the original `startswith(('wlan','wlp','wlx'))` heuristic. The
+    sysfs check returns True iff /sys/class/net/<iface>/wireless exists,
+    which is created by cfg80211 regardless of naming scheme.
+
+    On the dev host /sys/class/net doesn't exist so the call returns
+    False — which is the right answer because iw also doesn't exist
+    there. We patch os.path.isdir to simulate the kernel-side directory
+    existence."""
+    from src.tools.diag_impls import network_interface as mod
+
+    def fake_isdir(path):
+        return path == "/sys/class/net/wlP2p33s0/wireless"
+
+    with patch("os.path.isdir", side_effect=fake_isdir):
+        assert mod._looks_like_wifi("wlP2p33s0") is True
+        assert mod._looks_like_wifi("eth0") is False
+        assert mod._looks_like_wifi("enx00e04c505a48") is False
+        assert mod._looks_like_wifi("docker0") is False
+        assert mod._looks_like_wifi("br-6ee64bca2132") is False
 
 
 # ---------------------------------------------------------------------------

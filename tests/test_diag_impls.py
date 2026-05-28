@@ -1613,3 +1613,144 @@ def test_real_executor_known_tools_set_matches_schema():
     invocation will hit a 404 at runtime."""
     from src.tools.diag_impls import known_tools
     assert set(known_tools()) == _EXPECTED_TOOL_SET
+
+
+# ---------------------------------------------------------------------------
+# Phase 0.5d — cross-runtime consistency ratchets
+#
+# These tests enforce that the FIVE sources of truth for the diag/* tool
+# set stay aligned. Drift between any pair causes a real runtime bug:
+#
+#   1. _DISPATCH (src/tools/diag_impls/__init__.py)  → actual impls
+#   2. ToolName Literal (src/routes/diag.py)         → HTTP route enum
+#   3. _CANNED dict (src/runtime/mock_diag.py)       → mock executor
+#   4. ble_commands.json (fula-ota)                  → BLE command surface
+#   5. diag_responses.schema.json $defs (fula-ota)   → response contract
+#
+# Drift symptoms by direction:
+#   - dispatch has X but ToolName doesn't → HTTP 422 even though impl exists
+#   - dispatch has X but mock doesn't     → mock executor 404s on X
+#   - dispatch has X but ble_commands doesn't → BLE invocation fails
+#   - dispatch has X but $defs doesn't    → impl responses can't be validated
+#   - schema has X $def but no impl        → contract documents a non-existent tool
+# ---------------------------------------------------------------------------
+
+
+def test_consistency_dispatch_matches_route_enum():
+    """Every dispatched tool name must appear in ToolName Literal."""
+    from src.tools.diag_impls import known_tools
+    from src.routes.diag import ToolName
+    import typing
+    literal_args = set(typing.get_args(ToolName))
+    dispatched_short = {t.removeprefix("diag/") for t in known_tools()}
+    assert dispatched_short == literal_args, (
+        f"dispatch vs ToolName drift: "
+        f"in dispatch not in ToolName={dispatched_short - literal_args}; "
+        f"in ToolName not in dispatch={literal_args - dispatched_short}"
+    )
+
+
+def test_consistency_dispatch_matches_mock_canned():
+    """Every dispatched tool must have a canned mock response."""
+    from src.tools.diag_impls import known_tools
+    from src.runtime.mock_diag import _CANNED
+    dispatched = set(known_tools())
+    canned = set(_CANNED.keys())
+    assert dispatched == canned, (
+        f"dispatch vs mock drift: "
+        f"in dispatch not in mock={dispatched - canned}; "
+        f"in mock not in dispatch={canned - dispatched}"
+    )
+
+
+def test_consistency_dispatch_matches_ble_commands():
+    """Every diag/* in dispatch must be in fula-ota's ble_commands.json.
+    Skips cleanly when the fula-ota sibling checkout isn't present
+    (CI without the sibling can't enforce this — but local + lab CI
+    should)."""
+    from src.tools.diag_impls import known_tools
+    from .conftest import _locate_fula_ota_api_dir
+    api_dir = _locate_fula_ota_api_dir()
+    if api_dir is None:
+        pytest.skip("fula-ota sibling not available; set BLOX_AI_FULA_OTA_SCHEMA_DIR")
+    # ble_commands.json lives at the plugin root (one level UP from api/).
+    ble_path = api_dir.parent / "ble_commands.json"
+    if not ble_path.exists():
+        pytest.skip(f"ble_commands.json not at {ble_path}")
+    ble_data = json.loads(ble_path.read_text(encoding="utf-8"))
+    ble_diag_names = {
+        cmd["name"] for cmd in ble_data.get("commands", [])
+        if cmd.get("name", "").startswith("diag/")
+    }
+    dispatched = set(known_tools())
+    assert dispatched == ble_diag_names, (
+        f"dispatch vs ble_commands drift: "
+        f"in dispatch not in ble={dispatched - ble_diag_names}; "
+        f"in ble not in dispatch={ble_diag_names - dispatched}"
+    )
+
+
+def test_consistency_dispatch_matches_schema_defs():
+    """Every dispatched diag/X must have a $def `X` in
+    diag_responses.schema.json. Skips when fula-ota sibling absent."""
+    from src.tools.diag_impls import known_tools
+    from .conftest import _locate_fula_ota_api_dir
+    api_dir = _locate_fula_ota_api_dir()
+    if api_dir is None:
+        pytest.skip("fula-ota sibling not available")
+    schema_path = api_dir / "diag_responses.schema.json"
+    if not schema_path.exists():
+        pytest.skip(f"schema not at {schema_path}")
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema_defs = set(schema.get("$defs", {}).keys())
+    # The schema also defines helper types (severity, iso8601_datetime,
+    # subsystem_name) which aren't diag tools. Filter to the
+    # tool-shaped defs by intersecting with dispatched-name suffixes.
+    dispatched_short = {t.removeprefix("diag/") for t in known_tools()}
+    # Every dispatched tool MUST have a $def
+    missing_defs = dispatched_short - schema_defs
+    assert not missing_defs, (
+        f"dispatched tools without schema $def: {missing_defs}. "
+        f"Schema defs available: {schema_defs}"
+    )
+
+
+def test_consistency_ble_schema_versions_match():
+    """ble_commands.json and diag_responses.schema.json should share
+    the SAME schema_version — both bump on every diag-tool addition.
+    A divergence means someone added a tool to one file but forgot the
+    other."""
+    from .conftest import _locate_fula_ota_api_dir
+    api_dir = _locate_fula_ota_api_dir()
+    if api_dir is None:
+        pytest.skip("fula-ota sibling not available")
+    ble_path = api_dir.parent / "ble_commands.json"
+    schema_path = api_dir / "diag_responses.schema.json"
+    if not (ble_path.exists() and schema_path.exists()):
+        pytest.skip("contract files missing")
+    ble_v = json.loads(ble_path.read_text(encoding="utf-8")).get("schema_version")
+    schema_v = json.loads(schema_path.read_text(encoding="utf-8")).get("schema_version")
+    assert ble_v == schema_v, (
+        f"schema_version drift: ble_commands.json={ble_v}, "
+        f"diag_responses.schema.json={schema_v}. Both must bump together "
+        f"on every diag-tool addition (Phase 0.5d ratchet)."
+    )
+
+
+def test_consistency_ble_commands_schema_minimum_version():
+    """Defensive lower-bound: post-Phase-0.5c the schema_version MUST be
+    >= 4. Prevents accidental downgrade by a future PR that loses the
+    additive history."""
+    from .conftest import _locate_fula_ota_api_dir
+    api_dir = _locate_fula_ota_api_dir()
+    if api_dir is None:
+        pytest.skip("fula-ota sibling not available")
+    schema_path = api_dir / "diag_responses.schema.json"
+    if not schema_path.exists():
+        pytest.skip("schema missing")
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    sv = schema.get("schema_version")
+    assert isinstance(sv, int) and sv >= 4, (
+        f"diag_responses.schema.json schema_version must be >= 4 "
+        f"(Phase 0.5c was the v4 bump); got {sv!r}"
+    )

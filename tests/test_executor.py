@@ -186,7 +186,7 @@ def test_reject_token_invalid(executor):
         approval_token="!!!" + "x" * 64,
         security_code=None,
         action_name="docker.restart",
-        action_args={"container": "ipfs_host"},
+        action_args={"container": "ipfs_cluster"},
     )
     assert r["http_status"] == 401
     line = _last_audit_line(executor)
@@ -206,7 +206,7 @@ def test_reject_token_replayed(executor):
             approval_token=token,
             security_code=None,
             action_name="docker.restart",
-            action_args={"container": "ipfs_host"},
+            action_args={"container": "ipfs_cluster"},
         )
     # Replay
     r = _exec_sync(
@@ -215,7 +215,7 @@ def test_reject_token_replayed(executor):
         approval_token=token,
         security_code=None,
         action_name="docker.restart",
-        action_args={"container": "ipfs_host"},
+        action_args={"container": "ipfs_cluster"},
     )
     assert r["http_status"] == 401
     line = _last_audit_line(executor)
@@ -287,7 +287,7 @@ def test_tier2_subprocess_happy_path(executor):
             approval_token=token,
             security_code=None,
             action_name="docker.restart",
-            action_args={"container": "ipfs_host"},
+            action_args={"container": "ipfs_cluster"},
         )
     assert r["http_status"] == 200
     line = _last_audit_line(executor)
@@ -340,7 +340,7 @@ def test_whitelist_hash_stamped_on_every_line(executor):
     for _ in range(3):
         _exec_sync(executor, action_id="x", approval_token="bad",
                    security_code=None, action_name="docker.restart",
-                   action_args={"container": "ipfs_host"})
+                   action_args={"container": "ipfs_cluster"})
     token = executor.signer.sign("y")
     with patch("src.tools.executor.subprocess.run") as sub:
         from subprocess import CompletedProcess
@@ -348,7 +348,7 @@ def test_whitelist_hash_stamped_on_every_line(executor):
                                             stdout="", stderr="")
         _exec_sync(executor, action_id="y", approval_token=token,
                    security_code=None, action_name="docker.restart",
-                   action_args={"container": "ipfs_host"})
+                   action_args={"container": "ipfs_cluster"})
     lines = [json.loads(L) for L in
              Path(executor._audit_path_for_test).read_text().splitlines()]
     assert len(lines) == 4
@@ -362,7 +362,7 @@ def test_audit_line_required_fields_present(executor):
     """All schema-required fields appear on every line."""
     _exec_sync(executor, action_id="x", approval_token="bad",
                security_code=None, action_name="docker.restart",
-               action_args={"container": "ipfs_host"})
+               action_args={"container": "ipfs_cluster"})
     line = _last_audit_line(executor)
     required = {"ts", "request_id", "action_id", "action", "args", "tier",
                 "approval_token_valid", "security_code_required", "executed",
@@ -432,7 +432,7 @@ def test_concurrent_execute_hits_executor_busy(executor):
                     action_id="a", approval_token=token_a,
                     security_code=None,
                     action_name="docker.restart",
-                    action_args={"container": "ipfs_host"},
+                    action_args={"container": "ipfs_cluster"},
                 ),
                 executor.execute(
                     action_id="b", approval_token=token_b,
@@ -461,7 +461,7 @@ def test_subprocess_failure_records_success_false(executor):
         from subprocess import CompletedProcess
         sub.return_value = CompletedProcess(
             args=[], returncode=1,
-            stdout="", stderr="No such container: ipfs_host",
+            stdout="", stderr="No such container: ipfs_cluster",
         )
         r = _exec_sync(
             executor,
@@ -469,7 +469,7 @@ def test_subprocess_failure_records_success_false(executor):
             approval_token=token,
             security_code=None,
             action_name="docker.restart",
-            action_args={"container": "ipfs_host"},
+            action_args={"container": "ipfs_cluster"},
         )
     assert r["http_status"] == 200  # request succeeded; action failed
     line = _last_audit_line(executor)

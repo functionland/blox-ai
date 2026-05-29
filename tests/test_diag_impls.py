@@ -125,18 +125,56 @@ def test_relay_no_kubo_returns_empty():
     _validate(r, "relay")
 
 
-def test_relay_counts_circuit_peers():
+def test_relay_counts_own_reservations_not_circuit_peers():
+    """Regression 2026-05-29: count the node's OWN relay reservations
+    (circuit addresses in /api/v0/id Addresses), NOT swarm peers reached
+    via /p2p-circuit. Lab device held a valid reservation with
+    relay.fula.network yet the old peers-based probe returned
+    reservation_count=0 -> false 'no relay reservations' verdict.
+
+    Uses the real lab Addresses set: one reservation with one relay,
+    announced over 3 transports (tcp / quic-v1 / webtransport) -> the
+    3 circuit addresses dedupe to reservation_count=1. The 4 non-circuit
+    direct addresses are ignored."""
     from src.tools.diag_impls import relay as mod
-    peers = {
-        "Peers": [
-            {"Addr": "/ip4/1.2.3.4/tcp/4001"},
-            {"Addr": "/ip4/5.6.7.8/tcp/4001/p2p-circuit/p2p/QmABC"},
+    own = "12D3KooWCnRuQFScUBTmCi9EMNB7HrWHb12RPUdUZTjJb4FaF1nw"
+    relay_id = "12D3KooWLghRj2oKZE3aa9WggQ65wxyaooAriDQi4rzTsKpLoPLb"
+    id_resp = {
+        "ID": own,
+        "Addresses": [
+            f"/dns/relay.fula.network/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{own}",
+            f"/dns/relay.fula.network/udp/4001/quic-v1/p2p/{relay_id}/p2p-circuit/p2p/{own}",
+            f"/dns/relay.fula.network/udp/4001/quic-v1/webtransport/certhash/uEiCqi/certhash/uEiBvn/p2p/{relay_id}/p2p-circuit/p2p/{own}",
+            f"/ip4/127.0.0.1/tcp/4001/p2p/{own}",
+            f"/ip4/172.18.0.4/udp/4001/quic-v1/p2p/{own}",
+            f"/ip6/::1/tcp/4001/p2p/{own}",
         ],
     }
-    with patch.object(mod, "http_post_json", return_value=peers):
+    with patch.object(mod, "http_post_json", return_value=id_resp):
         r = mod.diag_relay()
-    assert r["reservation_count"] == 1
-    assert len(r["relays"]) == 2
+    assert r["reservation_count"] == 1, "one relay, 3 transports -> 1 reservation"
+    assert len(r["relays"]) == 3, "all 3 circuit addresses listed; direct addrs ignored"
+    assert all(x["has_circuit_reservation"] for x in r["relays"])
+    assert {x["dns_name"] for x in r["relays"]} == {"relay.fula.network"}
+    _validate(r, "relay")
+
+
+def test_relay_two_distinct_relays_counts_two():
+    """Two different relay peers -> two reservations (dedupe is per relay
+    peer id, not per address)."""
+    from src.tools.diag_impls import relay as mod
+    own = "12D3KooWownOwnOwnOwnOwnOwnOwnOwnOwnOwnOwnOwnOw"
+    id_resp = {
+        "ID": own,
+        "Addresses": [
+            f"/dns/relayA.fula.network/tcp/4001/p2p/12D3KooWrelayAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/p2p-circuit/p2p/{own}",
+            f"/dns/relayB.fula.network/tcp/4001/p2p/12D3KooWrelayBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB/p2p-circuit/p2p/{own}",
+        ],
+    }
+    with patch.object(mod, "http_post_json", return_value=id_resp):
+        r = mod.diag_relay()
+    assert r["reservation_count"] == 2
+    assert {x["dns_name"] for x in r["relays"]} == {"relayA.fula.network", "relayB.fula.network"}
     _validate(r, "relay")
 
 

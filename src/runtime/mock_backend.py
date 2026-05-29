@@ -18,7 +18,10 @@ The scripted sequence in C2:
 C4 wires an action_signer so recommended_action emits carry a real
 HMAC approval_token (otherwise /execute-action rejects them all at the
 token-validation gate). The action chosen (`docker.restart` with
-container=ipfs_host) is whitelisted in the canonical action_whitelist.json.
+container=ipfs_cluster) is whitelisted in the canonical
+action_whitelist.json. (kubo/ipfs_host is deliberately NOT individually
+restartable — kubo repairs route through restart_fula — so the mock picks
+ipfs_cluster, which reconnects to a still-running kubo.)
 """
 from __future__ import annotations
 
@@ -188,12 +191,13 @@ class MockBackend:
             "type": "recommended_action",
             "action_id": action_id,
             "action_name": "docker.restart",
-            "args": {"container": "ipfs_host"},
+            "args": {"container": "ipfs_cluster"},
             "reasoning": "Mock backend recommendation (whitelisted "
                         "docker.restart with arg-constraint-passing "
-                        "container=ipfs_host). On a real device + real "
+                        "container=ipfs_cluster). On a real device + real "
                         "backend, the model would pick this only when "
-                        "diag/containers shows an unhealthy kubo.",
+                        "diag/containers shows ipfs_cluster wedged while "
+                        "kubo itself is healthy.",
             "confidence": 0.8,
             "tier": 2,
             "approval_token": self._token_for(action_id),

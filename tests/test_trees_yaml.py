@@ -186,7 +186,14 @@ class TestDisconnectedTree:
         verdicts = [e for e in events if e["type"] == "verdict"]
         assert verdicts[-1]["payload"]["root_cause"] == "ext4_errors_present"
 
-    def test_kubo_unresponsive_emits_wedged_with_restart(self):
+    def test_kubo_unresponsive_emits_wedged_with_restart_fula(self):
+        # A wedged kubo must be repaired with restart_fula (full stack in
+        # dependency order), NOT a single docker.restart of ipfs_host:
+        # ipfs_cluster / fula_go / fula_pinning / fula_gateway all depend on
+        # kubo, so bouncing kubo alone leaves them attached to a daemon that
+        # vanished underneath them. ipfs_host is also off the docker.restart
+        # whitelist, so a single-kubo restart would be rejected by the
+        # executor anyway. This guards that invariant at the tree level.
         runner = _make_runner({
             "diag/internet": {"dns_ok": True, "https_google_ok": True,
                               "https_discovery_ok": True, "captive_portal_likely": False},
@@ -204,7 +211,9 @@ class TestDisconnectedTree:
         verdicts = [e for e in events if e["type"] == "verdict"]
         assert verdicts[-1]["payload"]["root_cause"] == "kubo_api_unresponsive"
         recs = [e for e in events if e["type"] == "recommended_action"]
-        assert any(
+        assert any(r["action_name"] == "restart_fula" for r in recs)
+        # never single-restart kubo
+        assert not any(
             r["action_name"] == "docker.restart" and r["args"].get("container") == "ipfs_host"
             for r in recs
         )

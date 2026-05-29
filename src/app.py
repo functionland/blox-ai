@@ -28,7 +28,7 @@ from src.tools.approval_token import ApprovalTokenSigner
 from src.tools.diag_impls import RealDiagExecutor, known_tools
 from src.tools.executor import ActionExecutor, WhitelistError, load_whitelist
 from src.schemas import SchemaRegistry
-from src.routes import cancel, classify, diag, execute, feedback, health, pending, troubleshoot
+from src.routes import cancel, classify, diag, execute, feedback, health, pending, support, troubleshoot
 
 
 logger = logging.getLogger("blox-ai")
@@ -217,3 +217,4 @@ app.include_router(pending.router)
 app.include_router(cancel.router)
 app.include_router(execute.router)
 app.include_router(classify.router)
+app.include_router(support.router)

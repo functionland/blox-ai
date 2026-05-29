@@ -1,8 +1,9 @@
 """diag/relay — libp2p relay reservation status.
 
-Calls the kubo HTTP API on 127.0.0.1:5001. The container needs network
-access to the host's kubo (per docker-compose: `network_mode: host` OR
-the host's 5001 bound on a reachable address).
+Calls the kubo HTTP API via BLOX_AI_KUBO_API_URL (docker-compose sets it to
+`http://ipfs_host:5001/api/v0` — the kubo container on the shared
+fula_default network). The blox-ai container is NOT network_mode: host, so
+127.0.0.1:5001 is its own empty loopback, not the host's kubo.
 
 What "reservation_count" means
 ------------------------------
@@ -29,11 +30,29 @@ reservation_count = number of distinct relays we're reserved through.
 """
 from __future__ import annotations
 
+import os
+
 from src.tools.diag_impls._helpers import http_post_json, now_iso
 
 
-# kubo API: POST (no body) per kubo's RPC convention.
-KUBO_ID_URL = "http://127.0.0.1:5001/api/v0/id"
+# kubo API base. Mirror kubo_health.py: read BLOX_AI_KUBO_API_URL, which
+# docker-compose sets to `http://ipfs_host:5001/api/v0` (the kubo container on
+# the shared fula_default network). Default to that same in-container hostname
+# so a missing env var still points somewhere real; host-side smoke scripts
+# override to 127.0.0.1.
+#
+# Bug fix 2026-05-29: this previously hardcoded `http://127.0.0.1:5001`, which
+# from inside the (non-host-networked) blox-ai container is Connection refused
+# on every call -> http_post_json returns None -> reservation_count was
+# structurally 0 on a perfectly healthy blox, firing a false "no relay
+# reservation" verdict every run. The lab device held 3 circuit reservations
+# via relay.fula.network that this probe could never see. POST, no body, per
+# kubo's RPC convention.
+KUBO_API_BASE = os.environ.get(
+    "BLOX_AI_KUBO_API_URL",
+    "http://ipfs_host:5001/api/v0",
+)
+KUBO_ID_URL = KUBO_API_BASE.rstrip("/") + "/id"
 
 _CIRCUIT = "/p2p-circuit"
 

@@ -178,6 +178,32 @@ def test_relay_two_distinct_relays_counts_two():
     _validate(r, "relay")
 
 
+def test_relay_url_uses_kubo_api_env_not_loopback(monkeypatch):
+    """Regression 2026-05-29: relay.py hardcoded http://127.0.0.1:5001, which
+    is Connection refused from inside the non-host-networked blox-ai container
+    -> reservation_count structurally 0 -> false 'no relay reservation'
+    verdict every run. It must read BLOX_AI_KUBO_API_URL like kubo_health.py."""
+    import importlib
+    from src.tools.diag_impls import relay as mod
+
+    monkeypatch.delenv("BLOX_AI_KUBO_API_URL", raising=False)
+    importlib.reload(mod)
+    assert "127.0.0.1" not in mod.KUBO_ID_URL
+    assert "ipfs_host" in mod.KUBO_ID_URL
+    assert mod.KUBO_ID_URL.endswith("/id")
+
+    monkeypatch.setenv("BLOX_AI_KUBO_API_URL", "http://ipfs_host:5001/api/v0")
+    importlib.reload(mod)
+    assert mod.KUBO_ID_URL == "http://ipfs_host:5001/api/v0/id"
+
+    monkeypatch.setenv("BLOX_AI_KUBO_API_URL", "http://127.0.0.1:5001/api/v0/")
+    importlib.reload(mod)
+    assert mod.KUBO_ID_URL == "http://127.0.0.1:5001/api/v0/id"
+
+    monkeypatch.delenv("BLOX_AI_KUBO_API_URL", raising=False)
+    importlib.reload(mod)
+
+
 # ---------------------------------------------------------------------------
 # diag/time
 # ---------------------------------------------------------------------------
@@ -1752,10 +1778,16 @@ def test_consistency_dispatch_matches_ble_commands():
     if not ble_path.exists():
         pytest.skip(f"ble_commands.json not at {ble_path}")
     ble_data = json.loads(ble_path.read_text(encoding="utf-8"))
+    # diag/bundle is a legitimate BLE command (it backs the app's Raw
+    # Diagnostics card) but is NOT a per-tool dispatch entry: it's the
+    # aggregator served by its own POST /diag/bundle route, which fans out
+    # to the dispatch tools. It has no known_tools() counterpart by design,
+    # so exclude it before the 1:1 name comparison.
+    NON_DISPATCH_DIAG = {"diag/bundle"}
     ble_diag_names = {
         cmd["name"] for cmd in ble_data.get("commands", [])
         if cmd.get("name", "").startswith("diag/")
-    }
+    } - NON_DISPATCH_DIAG
     dispatched = set(known_tools())
     assert dispatched == ble_diag_names, (
         f"dispatch vs ble_commands drift: "

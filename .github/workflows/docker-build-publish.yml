@@ -40,6 +40,16 @@ jobs:
 
       - name: Set up QEMU (for cross-platform arm64 build on amd64 runner)
         uses: docker/setup-qemu-action@v3
+        with:
+          # Pin QEMU binfmt by DIGEST. setup-qemu-action's previously-bundled
+          # QEMU segfaulted emulating arm64 dpkg/libc-bin post-install
+          # ("qemu: uncaught target signal 11 (Segmentation fault)" -> dpkg
+          # exit 139 at the apt-get layer, Dockerfile:116). The Dockerfile was
+          # unchanged from prior green builds; the runner's bundled QEMU
+          # regressed. This digest is the tonistiigi/binfmt image that :latest
+          # resolved to in the validated green build (~qemu-v10.2.3, 2026-06-08),
+          # pinned by digest so it cannot drift.
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

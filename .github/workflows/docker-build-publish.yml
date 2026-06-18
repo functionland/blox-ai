@@ -40,6 +40,15 @@ jobs:
 
       - name: Set up QEMU (for cross-platform arm64 build on amd64 runner)
         uses: docker/setup-qemu-action@v3
+        with:
+          # Pin a newer QEMU binfmt image. setup-qemu-action's bundled QEMU
+          # segfaults emulating arm64 dpkg/libc-bin post-install triggers
+          # ("qemu: uncaught target signal 11 (Segmentation fault)" -> dpkg
+          # exit 139 at the apt-get layer, Dockerfile:116). The Dockerfile is
+          # unchanged from prior green builds; the runner's bundled QEMU
+          # regressed. A newer QEMU fixes the emulation bug. Pin to a specific
+          # qemu-vX.Y.Z if reproducibility is preferred over `latest`.
+          image: tonistiigi/binfmt:latest
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

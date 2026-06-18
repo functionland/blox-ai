@@ -1089,6 +1089,42 @@ def test_identity_health_not_a_member_and_no_online():
     _validate(r, "identity_health")
 
 
+def test_identity_health_cluster_identity_is_directory():
+    """Docker bind-mount footgun: when identity.json is a DIRECTORY (dockerd
+    auto-created the absent file-bind source as a dir), the diag reports the
+    distinct `cluster_identity_is_directory` reason instead of the generic
+    `missing_cluster_peer_id`, so the not-earning tree can give a specific
+    "cluster identity is a folder" verdict. It must short-circuit before any
+    chain call."""
+    from src.tools.diag_impls import identity_health as mod
+    from src.tools.chain import clear_cache_for_tests
+    clear_cache_for_tests()
+
+    def fake_eth_call(*a, **k):
+        raise AssertionError("eth_call must not run when identity.json is a directory")
+
+    def fake_open_router(path, *args, **kwargs):
+        from io import StringIO
+        if path == mod.CONFIG_YAML_PATH:
+            return StringIO(_FAKE_CONFIG_YAML)
+        raise FileNotFoundError(path)
+
+    def fake_isdir(path):
+        return path == mod.CLUSTER_IDENTITY_PATH
+
+    with patch.object(mod, "eth_call", side_effect=fake_eth_call), \
+         patch("builtins.open", side_effect=fake_open_router), \
+         patch("os.path.isdir", side_effect=fake_isdir):
+        r = mod.diag_identity_health()
+    assert r["pool_member"] is None
+    assert r["pool_member_reason"] == "cluster_identity_is_directory"
+    assert r["online_recent"] is None
+    assert r["online_recent_reason"] == "cluster_identity_is_directory"
+    # Short-circuits before the peerID read + any chain call.
+    assert "cluster_peer_id" not in r
+    _validate(r, "identity_health")
+
+
 def test_identity_health_rpc_unreachable_marks_both_unknown():
     from src.tools.diag_impls import identity_health as mod
     from src.tools.chain import CallResult, clear_cache_for_tests

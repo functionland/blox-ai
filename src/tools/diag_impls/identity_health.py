@@ -109,6 +109,16 @@ def diag_identity_health() -> dict:
         return out
 
     # 2. Read cluster identity.json — get the on-chain peerID.
+    # A DIRECTORY at this path is the Docker bind-mount footgun: a *file*
+    # bind-mount of an absent identity.json makes dockerd create the source as
+    # an empty directory, which permanently wedges ipfs-cluster (its init loops
+    # on `[ -f identity.json ]`). Detect it precisely and report a distinct
+    # reason so the tree can give a specific "corrupted identity" verdict instead
+    # of conflating it with a legitimately-absent identity (pre-bootstrap).
+    if os.path.isdir(CLUSTER_IDENTITY_PATH):
+        out["pool_member_reason"] = "cluster_identity_is_directory"
+        out["online_recent_reason"] = "cluster_identity_is_directory"
+        return out
     cluster_peer = _read_cluster_peer_id(CLUSTER_IDENTITY_PATH)
     if not cluster_peer:
         out["pool_member_reason"] = "missing_cluster_peer_id"

@@ -74,6 +74,7 @@ def test_cross_site_post_from_unknown_origin_is_403(client):
     r = client.post("/cancel", json={"session_id": "x"}, headers={"Origin": EVIL})
     assert r.status_code == 403
     assert r.text == "origin not allowed"
+    assert "origin" in r.headers.get("vary", "").lower()
 
 
 def test_post_without_origin_is_untouched(client):

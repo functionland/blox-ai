@@ -65,7 +65,10 @@ class OriginGuardMiddleware:
                     origin = value.decode("latin-1")
                     break
             if origin and not origin_allowed(origin):
-                response = PlainTextResponse("origin not allowed", status_code=403)
+                # Vary: Origin so a cache never serves this rejection to an allow-listed origin.
+                response = PlainTextResponse(
+                    "origin not allowed", status_code=403, headers={"Vary": "Origin"}
+                )
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
